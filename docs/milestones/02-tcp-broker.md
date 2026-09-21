@@ -2,6 +2,12 @@
 
 producer와 consumer가 로그 파일을 직접 열지 않습니다. 장시간 실행되는 broker가 로그를 소유하고, client는 TCP request를 통해서만 데이터를 저장하고 읽습니다.
 
+완성 시점의 코드는 Git tag `milestone-2`로 보존되어 있습니다.
+
+```bash
+git checkout milestone-2
+```
+
 ## 학습 목표
 
 - TCP가 byte stream이므로 message 경계를 직접 표시해야 하는 이유

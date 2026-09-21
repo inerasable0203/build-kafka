@@ -6,6 +6,8 @@ import java.nio.charset.StandardCharsets;
 final class Protocol {
     static final byte PRODUCE = 1;
     static final byte FETCH = 2;
+    static final byte CREATE_TOPIC = 3;
+    static final byte METADATA = 4;
     static final byte OK = 0;
     static final byte INVALID_REQUEST = 1;
     static final byte SERVER_ERROR = 2;

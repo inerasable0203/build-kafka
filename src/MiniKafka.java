@@ -9,13 +9,22 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class MiniKafka {
+    record ProduceResult(int partition, long offset) {}
+
     private static final AtomicInteger CORRELATION_IDS = new AtomicInteger();
+    private static final ConcurrentMap<String, AtomicInteger> ROUND_ROBINS =
+            new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws Exception {
         if (args.length == 1 && args[0].equals("self-test")) {
@@ -26,6 +35,8 @@ public final class MiniKafka {
 
         switch (args[0]) {
             case "broker" -> runBroker(args);
+            case "create-topic" -> createTopicCommand(args);
+            case "describe-topic" -> describeTopicCommand(args);
             case "produce" -> produceCommand(args);
             case "consume" -> consumeCommand(args);
             default -> usage();
@@ -42,17 +53,33 @@ public final class MiniKafka {
         }
     }
 
+    private static void createTopicCommand(String[] args) throws IOException {
+        if (args.length != 5) usage();
+        int partitions = Integer.parseInt(args[4]);
+        createTopic(args[1], parsePort(args[2]), args[3], partitions);
+        System.out.printf("created topic %s with %d partitions%n", args[3], partitions);
+    }
+
+    private static void describeTopicCommand(String[] args) throws IOException {
+        if (args.length != 4) usage();
+        int partitions = partitionCount(args[1], parsePort(args[2]), args[3]);
+        System.out.printf("topic=%s partitions=%d%n", args[3], partitions);
+    }
+
     private static void produceCommand(String[] args) throws IOException {
-        if (args.length != 6) usage();
+        if (args.length < 6 || args.length > 7) usage();
         byte[] key = args[4].equals("-") ? null : utf8(args[4]);
-        long offset = produce(args[1], parsePort(args[2]), args[3], key, utf8(args[5]));
-        System.out.println(offset);
+        Integer partition = args.length == 7 ? parsePartition(args[6]) : null;
+        ProduceResult result =
+                produce(args[1], parsePort(args[2]), args[3], key, utf8(args[5]), partition);
+        System.out.printf("partition=%d offset=%d%n", result.partition(), result.offset());
     }
 
     private static void consumeCommand(String[] args) throws IOException {
-        if (args.length != 5) usage();
+        if (args.length != 6) usage();
+        int partition = parsePartition(args[4]);
         List<PartitionLog.Record> records =
-                fetch(args[1], parsePort(args[2]), args[3], Long.parseLong(args[4]));
+                fetch(args[1], parsePort(args[2]), args[3], partition, Long.parseLong(args[5]));
         for (PartitionLog.Record record : records) {
             String key = record.key() == null ? "-" : new String(record.key(), StandardCharsets.UTF_8);
             System.out.printf("%d\t%s\t%s%n", record.offset(), key,
@@ -60,39 +87,74 @@ public final class MiniKafka {
         }
     }
 
-    static long produce(String host, int port, String topic, byte[] key, byte[] value)
-            throws IOException {
+    static void createTopic(String host, int port, String topic, int partitions) throws IOException {
         int correlationId = CORRELATION_IDS.incrementAndGet();
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.CREATE_TOPIC);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(correlationId);
-            output.writeByte(Protocol.PRODUCE);
             Protocol.writeString(output, topic);
+            output.writeInt(partitions);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            Protocol.requireEnd(response);
+        }
+    }
+
+    static int partitionCount(String host, int port, String topic) throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.METADATA);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, topic);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            int partitions = response.readInt();
+            if (partitions < 1) throw new Protocol.ProtocolException("invalid partition count");
+            Protocol.requireEnd(response);
+            return partitions;
+        }
+    }
+
+    static ProduceResult produce(
+            String host, int port, String topic, byte[] key, byte[] value, Integer explicitPartition)
+            throws IOException {
+        int partition = explicitPartition != null
+                ? explicitPartition
+                : choosePartition(host, port, topic, key);
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.PRODUCE);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, topic);
+            output.writeInt(partition);
             Protocol.writeNullableBytes(output, key);
             Protocol.writeBytes(output, value);
         }
 
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            int storedPartition = response.readInt();
             long offset = response.readLong();
+            if (storedPartition != partition || offset < 0) {
+                throw new Protocol.ProtocolException("invalid produce response");
+            }
             Protocol.requireEnd(response);
-            return offset;
+            return new ProduceResult(storedPartition, offset);
         }
     }
 
-    static List<PartitionLog.Record> fetch(String host, int port, String topic, long offset)
-            throws IOException {
+    static List<PartitionLog.Record> fetch(
+            String host, int port, String topic, int partition, long offset) throws IOException {
         int correlationId = CORRELATION_IDS.incrementAndGet();
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.FETCH);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(correlationId);
-            output.writeByte(Protocol.FETCH);
             Protocol.writeString(output, topic);
+            output.writeInt(partition);
             output.writeLong(offset);
         }
 
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
             int count = response.readInt();
-            if (count < 0) throw new Protocol.ProtocolException("negative record count");
+            int minimumRecordSize = Long.BYTES * 2 + Integer.BYTES * 2;
+            if (count < 0 || count > response.available() / minimumRecordSize) {
+                throw new Protocol.ProtocolException("invalid record count");
+            }
 
             List<PartitionLog.Record> records = new ArrayList<>(count);
             for (int index = 0; index < count; index++) {
@@ -105,6 +167,26 @@ public final class MiniKafka {
             Protocol.requireEnd(response);
             return records;
         }
+    }
+
+    private static int choosePartition(String host, int port, String topic, byte[] key)
+            throws IOException {
+        int partitions = partitionCount(host, port, topic);
+        if (key != null) return Math.floorMod(Arrays.hashCode(key), partitions);
+
+        String brokerTopic = host + "\0" + port + "\0" + topic;
+        return Math.floorMod(
+                ROUND_ROBINS.computeIfAbsent(brokerTopic, ignored -> new AtomicInteger())
+                        .getAndIncrement(),
+                partitions);
+    }
+
+    private static ByteArrayOutputStream request(int correlationId, byte apiKey) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream output = new DataOutputStream(bytes);
+        output.writeInt(correlationId);
+        output.writeByte(apiKey);
+        return bytes;
     }
 
     private static DataInputStream exchange(
@@ -133,6 +215,12 @@ public final class MiniKafka {
         return port;
     }
 
+    private static int parsePartition(String value) {
+        int partition = Integer.parseInt(value);
+        if (partition < 0) throw new IllegalArgumentException("partition must be >= 0");
+        return partition;
+    }
+
     private static byte[] utf8(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
     }
@@ -150,24 +238,66 @@ public final class MiniKafka {
         }, "mini-kafka-self-test");
         try {
             brokerThread.start();
+            String host = "127.0.0.1";
+            int port = broker.port();
 
-            assert produce("127.0.0.1", broker.port(), "orders", utf8("alice"), utf8("coffee")) == 0;
-            assert produce("127.0.0.1", broker.port(), "orders", null, utf8("tea")) == 1;
-            List<PartitionLog.Record> records = fetch("127.0.0.1", broker.port(), "orders", 1);
-            assert records.size() == 1;
-            assert records.get(0).offset() == 1;
-            assert new String(records.get(0).value(), StandardCharsets.UTF_8).equals("tea");
+            createTopic(host, port, "orders", 3);
+            assert partitionCount(host, port, "orders") == 3;
 
-            rejectOversizedFrame(broker.port());
+            ProduceResult partitionZero =
+                    produce(host, port, "orders", utf8("explicit-0"), utf8("zero"), 0);
+            ProduceResult partitionOne =
+                    produce(host, port, "orders", utf8("explicit-1"), utf8("one"), 1);
+            assert partitionZero.offset() == 0;
+            assert partitionOne.offset() == 0;
+
+            ProduceResult sameKeyFirst =
+                    produce(host, port, "orders", utf8("alice"), utf8("coffee"), null);
+            ProduceResult sameKeySecond =
+                    produce(host, port, "orders", utf8("alice"), utf8("tea"), null);
+            assert sameKeyFirst.partition() == sameKeySecond.partition();
+            assert sameKeySecond.offset() == sameKeyFirst.offset() + 1;
+
+            Set<Integer> roundRobinPartitions = new HashSet<>();
+            for (int index = 0; index < 3; index++) {
+                roundRobinPartitions.add(
+                        produce(host, port, "orders", null, utf8("anonymous-" + index), null)
+                                .partition());
+            }
+            assert roundRobinPartitions.equals(Set.of(0, 1, 2));
+
+            List<PartitionLog.Record> records = fetch(host, port, "orders", 1, 0);
+            assert records.get(0).offset() == 0;
+            assert new String(records.get(0).value(), StandardCharsets.UTF_8).equals("one");
+
+            rejectOversizedFrame(port);
             broker.close();
             brokerThread.join(2_000);
             assert !brokerThread.isAlive();
             if (brokerFailure.get() != null) throw new AssertionError(brokerFailure.get());
 
-            try (PartitionLog reopened =
-                         new PartitionLog(directory.resolve("orders").resolve("0.log"))) {
-                assert reopened.append(null, utf8("water")) == 2;
+            assert Files.readString(directory.resolve("orders").resolve("topic.meta"))
+                    .trim().equals("3");
+            assert Files.isRegularFile(directory.resolve("orders").resolve("0.log"));
+            assert Files.isRegularFile(directory.resolve("orders").resolve("1.log"));
+            assert Files.isRegularFile(directory.resolve("orders").resolve("2.log"));
+
+            AtomicReference<Throwable> restartFailure = new AtomicReference<>();
+            Thread restartedThread;
+            try (Broker restarted = new Broker(directory, 0)) {
+                restartedThread = new Thread(() -> {
+                    try {
+                        restarted.serve();
+                    } catch (Throwable failure) {
+                        restartFailure.set(failure);
+                    }
+                }, "mini-kafka-restart-test");
+                restartedThread.start();
+                assert partitionCount(host, restarted.port(), "orders") == 3;
             }
+            restartedThread.join(2_000);
+            assert !restartedThread.isAlive();
+            if (restartFailure.get() != null) throw new AssertionError(restartFailure.get());
             System.out.println("self-test passed");
         } finally {
             broker.close();
@@ -203,8 +333,10 @@ public final class MiniKafka {
     private static void usage() {
         System.err.println("Usage:");
         System.err.println("  MiniKafka broker <data-dir> [port]");
-        System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value>");
-        System.err.println("  MiniKafka consume <host> <port> <topic> <offset>");
+        System.err.println("  MiniKafka create-topic <host> <port> <topic> <partitions>");
+        System.err.println("  MiniKafka describe-topic <host> <port> <topic>");
+        System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition]");
+        System.err.println("  MiniKafka consume <host> <port> <topic> <partition> <offset>");
         System.err.println("  MiniKafka self-test");
         System.exit(2);
     }

@@ -6,7 +6,7 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 2 완료:** TCP broker와 Produce/Fetch protocol
+**Milestone 3 완료:** topic metadata와 여러 partition
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
@@ -17,8 +17,11 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 - correlation ID를 이용한 요청과 응답 연결
 - 여러 client connection 동시 처리
 - 잘못되거나 16 MiB를 초과한 frame 거부
+- topic 생성과 영속적인 partition metadata
+- topic별 여러 partition과 독립 offset
+- 명시적 partition, key hash, null key round-robin 선택
 
-아직 여러 partition, consumer group, replication은 없습니다.
+아직 consumer group, replication, log segment/index는 없습니다.
 
 ## 빠른 실행
 
@@ -39,25 +42,32 @@ java -cp out MiniKafka broker data 9092
 다른 터미널에서 메시지를 저장하고 읽습니다.
 
 ```bash
+java -cp out MiniKafka create-topic 127.0.0.1 9092 orders 3
+java -cp out MiniKafka describe-topic 127.0.0.1 9092 orders
+
 java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-1 "ordered coffee"
-java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-2 "ordered tea"
-java -cp out MiniKafka consume 127.0.0.1 9092 orders 0
+java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-1 "ordered tea"
+java -cp out MiniKafka consume 127.0.0.1 9092 orders 1 0
 ```
 
 출력 예시:
 
 ```text
-0
-1
+created topic orders with 3 partitions
+topic=orders partitions=3
+partition=1 offset=0
+partition=1 offset=1
 0    customer-1    ordered coffee
-1    customer-2    ordered tea
+1    customer-1    ordered tea
 ```
 
-`-`를 key로 전달하면 null key로 저장합니다.
+마지막 인자로 partition을 지정할 수도 있습니다.
 
 ```bash
-java -cp out MiniKafka produce 127.0.0.1 9092 orders - "anonymous order"
+java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-3 "explicit partition" 2
 ```
+
+partition을 생략하면 key가 있는 레코드는 key hash로 partition을 정합니다. null key(`-`)는 같은 producer 프로세스 안에서 round-robin으로 선택합니다. 이 CLI는 명령마다 새 프로세스이므로 여러 null-key 명령의 분산을 관찰하려면 이후 장기 실행 producer 또는 self-test를 사용해야 합니다.
 
 ## 현재 구조
 
@@ -67,7 +77,8 @@ java -cp out MiniKafka produce 127.0.0.1 9092 orders - "anonymous order"
 ├── docs
 │   └── milestones
 │       ├── 01-persistent-log.md
-│       └── 02-tcp-broker.md
+│       ├── 02-tcp-broker.md
+│       └── 03-topics-partitions.md
 └── src
     ├── Broker.java          # TCP 연결과 request 처리
     ├── MiniKafka.java       # CLI와 network client
@@ -76,7 +87,10 @@ java -cp out MiniKafka produce 127.0.0.1 9092 orders - "anonymous order"
 
 data/                       # 실행 시 생성되며 Git에는 포함하지 않음
 └── <topic>/
-    └── 0.log               # 현재는 partition 0 하나만 존재
+    ├── topic.meta          # partition 개수
+    ├── 0.log
+    ├── 1.log
+    └── ...                 # partition별 독립 append-only log
 ```
 
 Milestone 1의 단일 파일을 저장소, protocol, broker, client의 네 역할로 분리했습니다. 각 클래스는 아직 interface나 별도 계층 없이 한 가지 구현만 가집니다.
@@ -107,12 +121,13 @@ request  = frame size | correlation ID | API key | API payload
 response = frame size | correlation ID | status  | response payload
 ```
 
-현재 API key는 `PRODUCE = 1`, `FETCH = 2`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 [Milestone 2 문서](docs/milestones/02-tcp-broker.md)에 기록합니다.
+현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
 
 ## 마일스톤 문서
 
 - [Milestone 1 — 영속 append-only log](docs/milestones/01-persistent-log.md)
 - [Milestone 2 — TCP broker와 protocol](docs/milestones/02-tcp-broker.md)
+- [Milestone 3 — topic과 partition](docs/milestones/03-topics-partitions.md)
 
 ## 구현 순서
 
@@ -148,16 +163,18 @@ response = frame size | correlation ID | status  | response payload
 
 **완료 조건:** broker와 client를 서로 다른 프로세스로 실행하고, 여러 client가 메시지를 저장하고 읽을 수 있어야 합니다.
 
-### Milestone 3 — topic과 partition
+완성된 코드는 Git tag `milestone-2`에서 확인할 수 있습니다.
+
+### Milestone 3 — topic과 partition `[완료]`
 
 **배우는 것:** Kafka가 전체 순서 대신 partition 내부 순서만 보장하여 처리량을 확장하는 방식
 
-- [ ] topic metadata와 생성 명령
-- [ ] topic별 여러 partition
-- [ ] 명시적 partition 선택
-- [ ] key hash 기반 partition 선택
-- [ ] null key round-robin 선택
-- [ ] partition별 독립 offset
+- [x] topic metadata와 생성 명령
+- [x] topic별 여러 partition
+- [x] 명시적 partition 선택
+- [x] key hash 기반 partition 선택
+- [x] null key round-robin 선택
+- [x] partition별 독립 offset
 
 **완료 조건:** 같은 key는 항상 같은 partition으로 가고, 각 partition의 offset이 독립적으로 증가해야 합니다.
 

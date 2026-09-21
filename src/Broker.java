@@ -7,7 +7,11 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,11 +21,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 final class Broker implements AutoCloseable {
+    private static final int MAX_PARTITIONS = 1_000;
+
     private final Path dataDirectory;
     private final ServerSocket server;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
-    private final Map<String, PartitionLog> logs = new HashMap<>();
+    private final Map<String, Topic> topics = new HashMap<>();
     private volatile boolean running = true;
 
     Broker(Path dataDirectory, int port) throws IOException {
@@ -75,6 +81,8 @@ final class Broker implements AutoCloseable {
                 return switch (apiKey) {
                     case Protocol.PRODUCE -> produce(correlationId, input);
                     case Protocol.FETCH -> fetch(correlationId, input);
+                    case Protocol.CREATE_TOPIC -> createTopic(correlationId, input);
+                    case Protocol.METADATA -> metadata(correlationId, input);
                     default -> error(correlationId, Protocol.INVALID_REQUEST, "unknown api key: " + apiKey);
                 };
             } catch (IllegalArgumentException | EOFException | Protocol.ProtocolException invalid) {
@@ -86,32 +94,31 @@ final class Broker implements AutoCloseable {
     }
 
     private byte[] produce(int correlationId, DataInputStream input) throws IOException {
-        String topic = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
         byte[] key = Protocol.readBytes(input, true);
         byte[] value = Protocol.readBytes(input, false);
         Protocol.requireEnd(input);
-        long offset = log(topic).append(key, value);
+        long offset = topic(topicName).log(partition).append(key, value);
 
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(correlationId);
-            output.writeByte(Protocol.OK);
+            output.writeInt(partition);
             output.writeLong(offset);
         }
         return bytes.toByteArray();
     }
 
     private byte[] fetch(int correlationId, DataInputStream input) throws IOException {
-        String topic = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
         long offset = input.readLong();
         Protocol.requireEnd(input);
 
         // ponytail: full-log fetch is enough for now; add byte limits with segmented logs.
-        List<PartitionLog.Record> records = log(topic).readFrom(offset);
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        List<PartitionLog.Record> records = topic(topicName).log(partition).readFrom(offset);
+        ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(correlationId);
-            output.writeByte(Protocol.OK);
             output.writeInt(records.size());
             for (PartitionLog.Record record : records) {
                 output.writeLong(record.offset());
@@ -121,6 +128,34 @@ final class Broker implements AutoCloseable {
             }
         }
         return bytes.toByteArray();
+    }
+
+    private byte[] createTopic(int correlationId, DataInputStream input) throws IOException {
+        String topic = Protocol.readString(input);
+        int partitions = input.readInt();
+        Protocol.requireEnd(input);
+        createTopic(topic, partitions);
+        return success(correlationId).toByteArray();
+    }
+
+    private byte[] metadata(int correlationId, DataInputStream input) throws IOException {
+        String topicName = Protocol.readString(input);
+        Protocol.requireEnd(input);
+        int partitions = topic(topicName).partitionCount();
+
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            output.writeInt(partitions);
+        }
+        return bytes.toByteArray();
+    }
+
+    private static ByteArrayOutputStream success(int correlationId) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream output = new DataOutputStream(bytes);
+        output.writeInt(correlationId);
+        output.writeByte(Protocol.OK);
+        return bytes;
     }
 
     private static byte[] error(int correlationId, byte status, String message) throws IOException {
@@ -133,14 +168,52 @@ final class Broker implements AutoCloseable {
         return bytes.toByteArray();
     }
 
-    private synchronized PartitionLog log(String topic) throws IOException {
-        if (!topic.matches("[A-Za-z0-9._-]+")) throw new IllegalArgumentException("invalid topic name");
-        PartitionLog existing = logs.get(topic);
+    private synchronized void createTopic(String name, int partitionCount) throws IOException {
+        validateTopicName(name);
+        if (partitionCount < 1 || partitionCount > MAX_PARTITIONS) {
+            throw new IllegalArgumentException("partition count must be between 1 and " + MAX_PARTITIONS);
+        }
+
+        Path directory = dataDirectory.resolve(name);
+        Path metadata = directory.resolve("topic.meta");
+        Files.createDirectories(directory);
+        try {
+            Files.writeString(metadata, Integer.toString(partitionCount),
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        } catch (FileAlreadyExistsException duplicate) {
+            throw new IllegalArgumentException("topic already exists: " + name);
+        }
+        topics.put(name, new Topic(directory, partitionCount));
+    }
+
+    private synchronized Topic topic(String name) throws IOException {
+        validateTopicName(name);
+        Topic existing = topics.get(name);
         if (existing != null) return existing;
 
-        PartitionLog created = new PartitionLog(dataDirectory.resolve(topic).resolve("0.log"));
-        logs.put(topic, created);
-        return created;
+        Path directory = dataDirectory.resolve(name);
+        String stored;
+        try {
+            stored = Files.readString(directory.resolve("topic.meta")).trim();
+        } catch (NoSuchFileException missing) {
+            throw new IllegalArgumentException("unknown topic: " + name);
+        }
+
+        try {
+            int partitionCount = Integer.parseInt(stored);
+            if (partitionCount < 1 || partitionCount > MAX_PARTITIONS) {
+                throw new IOException("invalid metadata for topic: " + name);
+            }
+            Topic loaded = new Topic(directory, partitionCount);
+            topics.put(name, loaded);
+            return loaded;
+        } catch (NumberFormatException invalid) {
+            throw new IOException("invalid metadata for topic: " + name, invalid);
+        }
+    }
+
+    private static void validateTopicName(String topic) {
+        if (!topic.matches("[A-Za-z0-9._-]+")) throw new IllegalArgumentException("invalid topic name");
     }
 
     @Override
@@ -152,13 +225,54 @@ final class Broker implements AutoCloseable {
         workers.shutdownNow();
 
         IOException failure = null;
-        for (PartitionLog log : logs.values()) {
+        for (Topic topic : topics.values()) {
             try {
-                log.close();
+                topic.close();
             } catch (IOException error) {
                 failure = error;
             }
         }
         if (failure != null) throw failure;
+    }
+
+    private static final class Topic implements AutoCloseable {
+        private final Path directory;
+        private final int partitionCount;
+        private final Map<Integer, PartitionLog> logs = new HashMap<>();
+
+        Topic(Path directory, int partitionCount) {
+            this.directory = directory;
+            this.partitionCount = partitionCount;
+        }
+
+        int partitionCount() {
+            return partitionCount;
+        }
+
+        synchronized PartitionLog log(int partition) throws IOException {
+            if (partition < 0 || partition >= partitionCount) {
+                throw new IllegalArgumentException("partition must be between 0 and "
+                        + (partitionCount - 1));
+            }
+            PartitionLog existing = logs.get(partition);
+            if (existing != null) return existing;
+
+            PartitionLog created = new PartitionLog(directory.resolve(partition + ".log"));
+            logs.put(partition, created);
+            return created;
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            IOException failure = null;
+            for (PartitionLog log : logs.values()) {
+                try {
+                    log.close();
+                } catch (IOException error) {
+                    failure = error;
+                }
+            }
+            if (failure != null) throw failure;
+        }
     }
 }
