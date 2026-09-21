@@ -6,16 +6,19 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 1 완료:** 파일 기반 단일 topic / 단일 partition 로그
+**Milestone 2 완료:** TCP broker와 Produce/Fetch protocol
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
 - 프로세스 재시작 후 로그와 다음 offset 복구
 - CRC32 checksum으로 데이터 손상 감지
-- 쓰기 도중 종료되어 불완전해진 마지막 레코드 복구
-- 특정 offset부터 레코드 조회
+- TCP 위에서 동작하는 길이 prefix binary frame
+- `PRODUCE`와 `FETCH` request/response
+- correlation ID를 이용한 요청과 응답 연결
+- 여러 client connection 동시 처리
+- 잘못되거나 16 MiB를 초과한 frame 거부
 
-아직 broker 서버, 여러 partition, consumer group, replication은 없습니다.
+아직 여러 partition, consumer group, replication은 없습니다.
 
 ## 빠른 실행
 
@@ -23,16 +26,22 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ```bash
 mkdir -p out
-javac -d out src/MiniKafka.java
+javac -d out src/*.java
 java -ea -cp out MiniKafka self-test
 ```
 
-메시지를 저장하고 읽어 봅니다.
+첫 번째 터미널에서 broker를 실행합니다.
 
 ```bash
-java -cp out MiniKafka produce data orders customer-1 "ordered coffee"
-java -cp out MiniKafka produce data orders customer-2 "ordered tea"
-java -cp out MiniKafka consume data orders 0
+java -cp out MiniKafka broker data 9092
+```
+
+다른 터미널에서 메시지를 저장하고 읽습니다.
+
+```bash
+java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-1 "ordered coffee"
+java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-2 "ordered tea"
+java -cp out MiniKafka consume 127.0.0.1 9092 orders 0
 ```
 
 출력 예시:
@@ -47,7 +56,7 @@ java -cp out MiniKafka consume data orders 0
 `-`를 key로 전달하면 null key로 저장합니다.
 
 ```bash
-java -cp out MiniKafka produce data orders - "anonymous order"
+java -cp out MiniKafka produce 127.0.0.1 9092 orders - "anonymous order"
 ```
 
 ## 현재 구조
@@ -55,15 +64,22 @@ java -cp out MiniKafka produce data orders - "anonymous order"
 ```text
 .
 ├── README.md
+├── docs
+│   └── milestones
+│       ├── 01-persistent-log.md
+│       └── 02-tcp-broker.md
 └── src
-    └── MiniKafka.java
+    ├── Broker.java          # TCP 연결과 request 처리
+    ├── MiniKafka.java       # CLI와 network client
+    ├── PartitionLog.java    # append-only disk log
+    └── Protocol.java        # binary frame과 자료형 encoding
 
 data/                       # 실행 시 생성되며 Git에는 포함하지 않음
 └── <topic>/
     └── 0.log               # 현재는 partition 0 하나만 존재
 ```
 
-`MiniKafka.java`는 학습 흐름을 한눈에 볼 수 있도록 아직 파일 하나로 유지합니다. 역할이 실제로 분리되는 Milestone 2부터 필요한 만큼만 나눕니다.
+Milestone 1의 단일 파일을 저장소, protocol, broker, client의 네 역할로 분리했습니다. 각 클래스는 아직 interface나 별도 계층 없이 한 가지 구현만 가집니다.
 
 ## 레코드 저장 형식
 
@@ -81,6 +97,22 @@ data/                       # 실행 시 생성되며 Git에는 포함하지 않
 | CRC32 | 4 bytes | payload 손상 검사용 checksum |
 
 현재 `fsync`를 매 append마다 호출합니다. 느리지만 첫 단계에서는 durability 동작을 명확하게 확인하기 위한 선택입니다. batching은 뒤 단계에서 측정 후 추가합니다.
+
+## TCP frame 형식
+
+모든 request와 response 앞에는 뒤따르는 body 크기를 나타내는 4-byte 정수가 붙습니다.
+
+```text
+request  = frame size | correlation ID | API key | API payload
+response = frame size | correlation ID | status  | response payload
+```
+
+현재 API key는 `PRODUCE = 1`, `FETCH = 2`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 [Milestone 2 문서](docs/milestones/02-tcp-broker.md)에 기록합니다.
+
+## 마일스톤 문서
+
+- [Milestone 1 — 영속 append-only log](docs/milestones/01-persistent-log.md)
+- [Milestone 2 — TCP broker와 protocol](docs/milestones/02-tcp-broker.md)
 
 ## 구현 순서
 
@@ -100,17 +132,19 @@ data/                       # 실행 시 생성되며 Git에는 포함하지 않
 
 **완료 조건:** 두 레코드를 쓴 뒤 프로세스를 다시 열어 offset 1부터 읽고, 다음 append가 offset 2를 받아야 합니다.
 
-### Milestone 2 — TCP broker와 protocol
+완성된 코드는 Git tag `milestone-1`에서 확인할 수 있습니다.
+
+### Milestone 2 — TCP broker와 protocol `[완료]`
 
 **배우는 것:** producer와 consumer가 저장소에 직접 접근하지 않고 broker에 request/response를 보내는 이유
 
-- [ ] long-running broker process
-- [ ] 길이 prefix가 있는 binary frame
-- [ ] `PRODUCE` request/response
-- [ ] `FETCH` request/response
-- [ ] correlation id로 요청과 응답 연결
-- [ ] 잘못된 frame과 너무 큰 request 거부
-- [ ] producer/consumer CLI를 TCP client로 변경
+- [x] long-running broker process
+- [x] 길이 prefix가 있는 binary frame
+- [x] `PRODUCE` request/response
+- [x] `FETCH` request/response
+- [x] correlation id로 요청과 응답 연결
+- [x] 잘못된 frame과 너무 큰 request 거부
+- [x] producer/consumer CLI를 TCP client로 변경
 
 **완료 조건:** broker와 client를 서로 다른 프로세스로 실행하고, 여러 client가 메시지를 저장하고 읽을 수 있어야 합니다.
 
