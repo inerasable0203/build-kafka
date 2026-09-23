@@ -25,6 +25,8 @@ final class Broker implements AutoCloseable {
 
     private final Path dataDirectory;
     private final long segmentBytes;
+    private final long retentionMs;
+    private final long retentionBytes;
     private final ServerSocket server;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
@@ -36,9 +38,19 @@ final class Broker implements AutoCloseable {
     }
 
     Broker(Path dataDirectory, int port, long segmentBytes) throws IOException {
+        this(dataDirectory, port, segmentBytes, -1, -1);
+    }
+
+    Broker(Path dataDirectory, int port, long segmentBytes, long retentionMs,
+            long retentionBytes) throws IOException {
         if (segmentBytes < 1) throw new IllegalArgumentException("segment size must be positive");
+        if (retentionMs < -1 || retentionBytes < -1) {
+            throw new IllegalArgumentException("retention limits must be >= -1");
+        }
         this.dataDirectory = dataDirectory;
         this.segmentBytes = segmentBytes;
+        this.retentionMs = retentionMs;
+        this.retentionBytes = retentionBytes;
         server = new ServerSocket(port);
     }
 
@@ -90,6 +102,7 @@ final class Broker implements AutoCloseable {
                     case Protocol.FETCH -> fetch(correlationId, input);
                     case Protocol.CREATE_TOPIC -> createTopic(correlationId, input);
                     case Protocol.METADATA -> metadata(correlationId, input);
+                    case Protocol.COMPACT -> compact(correlationId, input);
                     default -> error(correlationId, Protocol.INVALID_REQUEST, "unknown api key: " + apiKey);
                 };
             } catch (IllegalArgumentException | EOFException | Protocol.ProtocolException invalid) {
@@ -104,13 +117,22 @@ final class Broker implements AutoCloseable {
         String topicName = Protocol.readString(input);
         int partition = input.readInt();
         byte[] key = Protocol.readBytes(input, true);
-        byte[] value = Protocol.readBytes(input, false);
+        byte[] value = Protocol.readBytes(input, true);
         Protocol.requireEnd(input);
-        long responseRecordBytes = 24L + (key == null ? 0 : key.length) + value.length;
+        if (key == null && value == null) {
+            throw new IllegalArgumentException("tombstone requires a key");
+        }
+        long responseRecordBytes = 24L + (key == null ? 0 : key.length)
+                + (value == null ? 0 : value.length);
         if (responseRecordBytes > Protocol.MAX_FRAME_SIZE - 9) {
             throw new IllegalArgumentException("record exceeds fetch frame limit");
         }
-        long offset = topic(topicName).log(partition).append(key, value);
+        PartitionLog log = topic(topicName).log(partition);
+        long offset = log.append(key, value);
+        if (retentionMs >= 0 || retentionBytes >= 0) {
+            // ponytail: scan on append; schedule periodic cleanup if many segments make this costly.
+            log.applyRetention(System.currentTimeMillis(), retentionMs, retentionBytes);
+        }
 
         ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
@@ -135,7 +157,7 @@ final class Broker implements AutoCloseable {
                 output.writeLong(record.offset());
                 output.writeLong(record.timestamp());
                 Protocol.writeNullableBytes(output, record.key());
-                Protocol.writeBytes(output, record.value());
+                Protocol.writeNullableBytes(output, record.value());
             }
         }
         return bytes.toByteArray();
@@ -159,6 +181,14 @@ final class Broker implements AutoCloseable {
             output.writeInt(partitions);
         }
         return bytes.toByteArray();
+    }
+
+    private byte[] compact(int correlationId, DataInputStream input) throws IOException {
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
+        Protocol.requireEnd(input);
+        topic(topicName).log(partition).compact();
+        return success(correlationId).toByteArray();
     }
 
     private static ByteArrayOutputStream success(int correlationId) throws IOException {

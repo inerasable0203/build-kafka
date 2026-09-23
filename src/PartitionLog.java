@@ -7,9 +7,13 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.CRC32;
 
 final class PartitionLog implements AutoCloseable {
@@ -58,7 +62,9 @@ final class PartitionLog implements AutoCloseable {
     }
 
     synchronized long append(byte[] key, byte[] value) throws IOException {
-        if (value == null) throw new IllegalArgumentException("value must not be null");
+        if (key == null && value == null) {
+            throw new IllegalArgumentException("tombstone requires a key");
+        }
         byte[] payload = encode(nextOffset, System.currentTimeMillis(), key, value);
         Segment active = segments.get(segments.size() - 1);
         if (active.log.length() >= segmentBytes && active.log.length() > 0) {
@@ -100,7 +106,7 @@ final class PartitionLog implements AutoCloseable {
                 Record record = readRecord(segment.log);
                 if (record.offset() >= requestedOffset) {
                     long recordBytes = 24L + (record.key() == null ? 0 : record.key().length)
-                            + record.value().length;
+                            + (record.value() == null ? 0 : record.value().length);
                     if (recordBytes > maxResponseBytes) {
                         if (records.isEmpty()) throw new IOException("record exceeds fetch frame limit");
                         return records;
@@ -144,10 +150,11 @@ final class PartitionLog implements AutoCloseable {
         bases.sort(Comparator.naturalOrder());
         if (bases.isEmpty()) bases.add(0L);
 
-        long expectedOffset = 0;
+        long next = 0;
         for (int i = 0; i < bases.size(); i++) {
             long base = bases.get(i);
-            if (base != expectedOffset) throw new IOException("unexpected segment base offset: " + base);
+            if (base < next) throw new IOException("overlapping segment base offset: " + base);
+            next = base;
             Segment segment = openSegment(base);
             segments.add(segment);
             segment.log.seek(0);
@@ -156,14 +163,14 @@ final class PartitionLog implements AutoCloseable {
                 long position = segment.log.getFilePointer();
                 try {
                     Record record = readRecord(segment.log);
-                    if (record.offset() != expectedOffset) {
-                        throw new IOException("non-sequential offset " + record.offset()
-                                + ", expected " + expectedOffset);
+                    if (record.offset() < next || (i + 1 < bases.size()
+                            && record.offset() >= bases.get(i + 1))) {
+                        throw new IOException("invalid offset " + record.offset() + " in segment " + base);
                     }
                     if (segment.records % INDEX_INTERVAL == 0) {
-                        segment.addIndex(expectedOffset, position);
+                        segment.addIndex(record.offset(), position);
                     }
-                    expectedOffset++;
+                    next = record.offset() + 1;
                     segment.records++;
                     lastGoodPosition = segment.log.getFilePointer();
                 } catch (EOFException incompleteTail) {
@@ -176,7 +183,105 @@ final class PartitionLog implements AutoCloseable {
             }
             segment.index.getFD().sync();
         }
-        nextOffset = expectedOffset;
+        nextOffset = next;
+    }
+
+    synchronized void applyRetention(long now, long retentionMs, long retentionBytes)
+            throws IOException {
+        if (retentionMs < -1 || retentionBytes < -1) {
+            throw new IllegalArgumentException("retention limits must be >= -1");
+        }
+        for (int i = 0; i < segments.size() - 1;) {
+            Segment segment = segments.get(i);
+            if (retentionMs >= 0 && now - Files.getLastModifiedTime(segment.logPath).toMillis()
+                    >= retentionMs) {
+                removeSegment(i);
+            } else {
+                i++;
+            }
+        }
+        if (retentionBytes >= 0) {
+            long total = 0;
+            for (Segment segment : segments) total += segment.log.length();
+            while (total > retentionBytes && segments.size() > 1) {
+                long removedBytes = segments.get(0).log.length();
+                removeSegment(0);
+                total -= removedBytes;
+            }
+        }
+    }
+
+    synchronized void compact() throws IOException {
+        Map<ByteBuffer, Long> latest = new HashMap<>();
+        for (Segment segment : segments) {
+            segment.log.seek(0);
+            while (segment.log.getFilePointer() < segment.log.length()) {
+                Record record = readRecord(segment.log);
+                if (record.key() != null) latest.put(ByteBuffer.wrap(record.key()), record.offset());
+            }
+        }
+        for (int i = 0; i < segments.size() - 1;) {
+            Segment segment = segments.get(i);
+            Path temporary = Files.createTempFile(directory, "compact-", ".log");
+            boolean changed = false;
+            long kept = 0;
+            try {
+                try (RandomAccessFile output = new RandomAccessFile(temporary.toFile(), "rw")) {
+                    segment.log.seek(0);
+                    while (segment.log.getFilePointer() < segment.log.length()) {
+                        Record record = readRecord(segment.log);
+                        if (record.key() == null || latest.get(ByteBuffer.wrap(record.key()))
+                                == record.offset()) {
+                            writeRecord(output, record);
+                            kept++;
+                        } else {
+                            changed = true;
+                        }
+                    }
+                    output.getFD().sync();
+                }
+                if (!changed) {
+                    i++;
+                } else if (kept == 0) {
+                    removeSegment(i);
+                } else {
+                    segment.close();
+                    Files.move(temporary, segment.logPath, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                    Segment rewritten = openSegment(segment.baseOffset);
+                    rewritten.log.seek(0);
+                    while (rewritten.log.getFilePointer() < rewritten.log.length()) {
+                        long position = rewritten.log.getFilePointer();
+                        Record record = readRecord(rewritten.log);
+                        if (rewritten.records % INDEX_INTERVAL == 0) {
+                            rewritten.addIndex(record.offset(), position);
+                        }
+                        rewritten.records++;
+                    }
+                    rewritten.index.getFD().sync();
+                    segments.set(i++, rewritten);
+                }
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        }
+    }
+
+    private void removeSegment(int index) throws IOException {
+        Segment segment = segments.get(index);
+        segment.close();
+        Files.delete(segment.logPath);
+        segments.remove(index);
+        Files.deleteIfExists(segment.indexPath);
+    }
+
+    private static void writeRecord(RandomAccessFile file, Record record) throws IOException {
+        byte[] payload = encode(record.offset(), record.timestamp(), record.key(), record.value());
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        file.writeInt(payload.length);
+        file.write(payload);
+        file.writeInt((int) crc.getValue());
     }
 
     private Segment openSegment(long baseOffset) throws IOException {
@@ -202,12 +307,12 @@ final class PartitionLog implements AutoCloseable {
             long timestamp = input.readLong();
             int keySize = input.readInt();
             int valueSize = input.readInt();
-            if (keySize < -1 || valueSize < 0
-                    || (long) Math.max(keySize, 0) + valueSize != input.available()) {
+            if (keySize < -1 || valueSize < -1 || (keySize == -1 && valueSize == -1)
+                    || (long) Math.max(keySize, 0) + Math.max(valueSize, 0) != input.available()) {
                 throw new IOException("invalid key/value sizes");
             }
             byte[] key = keySize == -1 ? null : input.readNBytes(keySize);
-            byte[] value = input.readNBytes(valueSize);
+            byte[] value = valueSize == -1 ? null : input.readNBytes(valueSize);
             return new Record(offset, timestamp, key, value);
         }
     }
@@ -215,7 +320,9 @@ final class PartitionLog implements AutoCloseable {
     private static byte[] encode(long offset, long timestamp, byte[] key, byte[] value)
             throws IOException {
         int keySize = key == null ? -1 : key.length;
-        long payloadSize = (long) MIN_PAYLOAD_SIZE + Math.max(keySize, 0) + value.length;
+        int valueSize = value == null ? -1 : value.length;
+        long payloadSize = (long) MIN_PAYLOAD_SIZE + Math.max(keySize, 0)
+                + Math.max(valueSize, 0);
         if (payloadSize > MAX_PAYLOAD_SIZE) throw new IllegalArgumentException("record is too large");
 
         ByteArrayOutputStream bytes = new ByteArrayOutputStream((int) payloadSize);
@@ -223,9 +330,9 @@ final class PartitionLog implements AutoCloseable {
             output.writeLong(offset);
             output.writeLong(timestamp);
             output.writeInt(keySize);
-            output.writeInt(value.length);
+            output.writeInt(valueSize);
             if (key != null) output.write(key);
-            output.write(value);
+            if (value != null) output.write(value);
         }
         return bytes.toByteArray();
     }
@@ -246,12 +353,16 @@ final class PartitionLog implements AutoCloseable {
 
     private static final class Segment implements AutoCloseable {
         private final long baseOffset;
+        private final Path logPath;
+        private final Path indexPath;
         private final RandomAccessFile log;
         private final RandomAccessFile index;
         private long records;
 
         Segment(long baseOffset, Path logPath, Path indexPath) throws IOException {
             this.baseOffset = baseOffset;
+            this.logPath = logPath;
+            this.indexPath = indexPath;
             log = new RandomAccessFile(logPath.toFile(), "rw");
             try {
                 index = new RandomAccessFile(indexPath.toFile(), "rw");

@@ -6,7 +6,7 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 4 완료:** log segment와 sparse offset index
+**Milestone 5 완료:** retention, log compaction, tombstone
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
@@ -22,8 +22,10 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 - 명시적 partition, key hash, null key round-robin 선택
 - partition별 segment 분할과 sparse index를 이용한 offset 검색
 - 재시작 시 segment 검증과 index 재구성
+- 시간·용량 기준으로 오래된 closed segment 삭제
+- key별 오래된 값을 정리하는 compaction과 tombstone
 
-아직 consumer group, replication, retention은 없습니다.
+아직 consumer group과 replication은 없습니다.
 
 ## 빠른 실행
 
@@ -69,6 +71,13 @@ partition=1 offset=1
 java -cp out MiniKafka produce 127.0.0.1 9092 orders customer-3 "explicit partition" 2
 ```
 
+key 삭제 표시는 tombstone으로 기록할 수 있습니다. 닫힌 segment의 오래된 값을 정리하려면 compaction을 실행합니다.
+
+```bash
+java -cp out MiniKafka delete 127.0.0.1 9092 orders customer-1 1
+java -cp out MiniKafka compact 127.0.0.1 9092 orders 1
+```
+
 partition을 생략하면 key가 있는 레코드는 key hash로 partition을 정합니다. null key(`-`)는 같은 producer 프로세스 안에서 round-robin으로 선택합니다. 이 CLI는 명령마다 새 프로세스이므로 여러 null-key 명령의 분산을 관찰하려면 이후 장기 실행 producer 또는 self-test를 사용해야 합니다.
 
 ## 현재 구조
@@ -81,7 +90,8 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 │       ├── 01-persistent-log.md
 │       ├── 02-tcp-broker.md
 │       ├── 03-topics-partitions.md
-│       └── 04-segments-index.md
+│       ├── 04-segments-index.md
+│       └── 05-retention-compaction.md
 └── src
     ├── Broker.java          # TCP 연결과 request 처리
     ├── MiniKafka.java       # CLI와 network client
@@ -110,7 +120,7 @@ Milestone 1의 단일 파일을 저장소, protocol, broker, client의 네 역�
 | offset | 8 bytes | partition 내부에서 증가하는 레코드 번호 |
 | timestamp | 8 bytes | 생성 시각(epoch milliseconds) |
 | key size | 4 bytes | null이면 `-1` |
-| value size | 4 bytes | value 길이 |
+| value size | 4 bytes | value 길이, tombstone이면 `-1` |
 | key | variable | 선택 사항 |
 | value | variable | 메시지 본문 |
 | CRC32 | 4 bytes | payload 손상 검사용 checksum |
@@ -125,9 +135,19 @@ partition 로그는 기본 1 MiB에 도달하면 다음 append 전에 새 segmen
 java -cp out MiniKafka broker data 9092 256
 ```
 
-segment 파일 이름은 해당 파일의 첫 offset이며, 16개 레코드마다 `.index`에 `(offset, byte position)`을 기록합니다. fetch는 segment 목록과 index를 각각 이진 탐색한 뒤 최대 15개 레코드만 건너뛰고 요청한 위치부터 읽습니다. 응답 크기가 16 MiB를 넘기 전에 fetch를 끊으므로 뒤의 레코드는 다음 offset으로 다시 조회합니다.
+segment 파일 이름은 생성 당시 첫 offset이며, 16개 레코드마다 `.index`에 `(offset, byte position)`을 기록합니다. compaction 후에는 파일의 첫 offset이 제거될 수도 있습니다. fetch는 segment 목록과 index를 각각 이진 탐색한 뒤 최대 15개 레코드만 건너뛰고 요청한 위치부터 읽습니다. 응답 크기가 16 MiB를 넘기 전에 fetch를 끊으므로 뒤의 레코드는 다음 offset으로 다시 조회합니다.
 
 Milestone 3 형식인 `<partition>.log`는 처음 열 때 `<partition>/0.log`로 옮깁니다. 재시작 시 index는 로그를 검사하며 다시 만들기 때문에 시작 시간은 전체 레코드 수에 비례합니다.
+
+## Retention과 compaction
+
+broker 실행 시 segment 크기 뒤에 retention 시간을 밀리초, retention 용량을 바이트로 지정할 수 있습니다. `-1`은 해당 제한을 끕니다. 새 레코드를 쓸 때만 정리하며, active segment는 삭제하지 않습니다.
+
+```bash
+java -cp out MiniKafka broker data 9092 256 60000 4096
+```
+
+`compact`는 지정한 partition의 닫힌 segment에서 key별 오래된 값을 제거합니다. key가 없는 레코드와 각 key의 마지막 레코드(tombstone 포함)는 남습니다. offset은 다시 매기지 않으므로 삭제된 offset부터 fetch하면 다음 남은 레코드가 반환됩니다. 자세한 실습은 [Milestone 5 문서](docs/milestones/05-retention-compaction.md)를 참고하세요.
 
 ## TCP frame 형식
 
@@ -138,7 +158,7 @@ request  = frame size | correlation ID | API key | API payload
 response = frame size | correlation ID | status  | response payload
 ```
 
-현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
+현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`, `COMPACT`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
 
 ## 마일스톤 문서
 
@@ -146,6 +166,7 @@ response = frame size | correlation ID | status  | response payload
 - [Milestone 2 — TCP broker와 protocol](docs/milestones/02-tcp-broker.md)
 - [Milestone 3 — topic과 partition](docs/milestones/03-topics-partitions.md)
 - [Milestone 4 — log segment와 sparse index](docs/milestones/04-segments-index.md)
+- [Milestone 5 — retention과 log compaction](docs/milestones/05-retention-compaction.md)
 
 ## 구현 순서
 
@@ -210,14 +231,16 @@ response = frame size | correlation ID | status  | response payload
 
 **완료 조건:** 여러 segment가 생성된 뒤에도 임의 offset fetch가 정확해야 하며, 전체 로그 선형 탐색 없이 대상 위치를 찾아야 합니다.
 
-### Milestone 5 — retention과 log compaction
+완성된 코드는 Git tag `milestone-4`에서 확인할 수 있습니다.
+
+### Milestone 5 — retention과 log compaction `[완료]`
 
 **배우는 것:** consumer가 읽었는지와 무관하게 broker가 저장 공간을 관리하는 방식
 
-- [ ] 보존 시간 기반 오래된 segment 삭제
-- [ ] 보존 용량 기반 오래된 segment 삭제
-- [ ] key별 최신 값만 남기는 compaction
-- [ ] tombstone 레코드
+- [x] 보존 시간 기반 오래된 segment 삭제
+- [x] 보존 용량 기반 오래된 segment 삭제
+- [x] key별 최신 값만 남기는 compaction
+- [x] tombstone 레코드
 
 **완료 조건:** active segment를 손상시키지 않고 정책에 해당하는 closed segment만 정리해야 합니다.
 

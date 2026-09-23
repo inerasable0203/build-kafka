@@ -8,6 +8,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -38,17 +39,22 @@ public final class MiniKafka {
             case "create-topic" -> createTopicCommand(args);
             case "describe-topic" -> describeTopicCommand(args);
             case "produce" -> produceCommand(args);
+            case "delete" -> deleteCommand(args);
             case "consume" -> consumeCommand(args);
+            case "compact" -> compactCommand(args);
             default -> usage();
         }
     }
 
     private static void runBroker(String[] args) throws IOException {
-        if (args.length < 2 || args.length > 4) usage();
+        if (args.length < 2 || args.length > 6) usage();
         int port = args.length >= 3 ? parsePort(args[2]) : 9092;
-        long segmentBytes = args.length == 4 ? Long.parseLong(args[3])
+        long segmentBytes = args.length >= 4 ? Long.parseLong(args[3])
                 : PartitionLog.DEFAULT_SEGMENT_BYTES;
-        try (Broker broker = new Broker(Path.of(args[1]), port, segmentBytes)) {
+        long retentionMs = args.length >= 5 ? Long.parseLong(args[4]) : -1;
+        long retentionBytes = args.length == 6 ? Long.parseLong(args[5]) : -1;
+        try (Broker broker = new Broker(Path.of(args[1]), port, segmentBytes,
+                retentionMs, retentionBytes)) {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> closeQuietly(broker)));
             System.out.println("broker listening on port " + broker.port());
             broker.serve();
@@ -77,6 +83,20 @@ public final class MiniKafka {
         System.out.printf("partition=%d offset=%d%n", result.partition(), result.offset());
     }
 
+    private static void deleteCommand(String[] args) throws IOException {
+        if (args.length < 5 || args.length > 6 || args[4].equals("-")) usage();
+        Integer partition = args.length == 6 ? parsePartition(args[5]) : null;
+        ProduceResult result = produce(args[1], parsePort(args[2]), args[3],
+                utf8(args[4]), null, partition);
+        System.out.printf("partition=%d offset=%d tombstone%n", result.partition(), result.offset());
+    }
+
+    private static void compactCommand(String[] args) throws IOException {
+        if (args.length != 5) usage();
+        compact(args[1], parsePort(args[2]), args[3], parsePartition(args[4]));
+        System.out.println("compaction complete");
+    }
+
     private static void consumeCommand(String[] args) throws IOException {
         if (args.length != 6) usage();
         int partition = parsePartition(args[4]);
@@ -84,8 +104,9 @@ public final class MiniKafka {
                 fetch(args[1], parsePort(args[2]), args[3], partition, Long.parseLong(args[5]));
         for (PartitionLog.Record record : records) {
             String key = record.key() == null ? "-" : new String(record.key(), StandardCharsets.UTF_8);
-            System.out.printf("%d\t%s\t%s%n", record.offset(), key,
-                    new String(record.value(), StandardCharsets.UTF_8));
+            String value = record.value() == null ? "<tombstone>"
+                    : new String(record.value(), StandardCharsets.UTF_8);
+            System.out.printf("%d\t%s\t%s%n", record.offset(), key, value);
         }
     }
 
@@ -127,7 +148,7 @@ public final class MiniKafka {
             Protocol.writeString(output, topic);
             output.writeInt(partition);
             Protocol.writeNullableBytes(output, key);
-            Protocol.writeBytes(output, value);
+            Protocol.writeNullableBytes(output, value);
         }
 
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
@@ -163,11 +184,23 @@ public final class MiniKafka {
                 long recordOffset = response.readLong();
                 long timestamp = response.readLong();
                 byte[] key = Protocol.readBytes(response, true);
-                byte[] value = Protocol.readBytes(response, false);
+                byte[] value = Protocol.readBytes(response, true);
                 records.add(new PartitionLog.Record(recordOffset, timestamp, key, value));
             }
             Protocol.requireEnd(response);
             return records;
+        }
+    }
+
+    static void compact(String host, int port, String topic, int partition) throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.COMPACT);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, topic);
+            output.writeInt(partition);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            Protocol.requireEnd(response);
         }
     }
 
@@ -272,6 +305,10 @@ public final class MiniKafka {
             assert records.get(0).offset() == 0;
             assert new String(records.get(0).value(), StandardCharsets.UTF_8).equals("one");
 
+            ProduceResult tombstone = produce(host, port, "orders", utf8("removed"), null, 1);
+            assert fetch(host, port, "orders", 1, tombstone.offset()).get(0).value() == null;
+            compact(host, port, "orders", 1);
+
             rejectOversizedFrame(port);
             broker.close();
             brokerThread.join(2_000);
@@ -301,6 +338,7 @@ public final class MiniKafka {
             assert !restartedThread.isAlive();
             if (restartFailure.get() != null) throw new AssertionError(restartFailure.get());
             segmentSelfTest(directory);
+            retentionCompactionSelfTest(directory);
             System.out.println("self-test passed");
         } finally {
             broker.close();
@@ -378,6 +416,55 @@ public final class MiniKafka {
         assert !Files.exists(originalPath);
     }
 
+    private static void retentionCompactionSelfTest(Path directory) throws IOException {
+        Path compactPath = directory.resolve("compact.log");
+        try (PartitionLog log = new PartitionLog(compactPath, 50)) {
+            assert log.append(utf8("a"), utf8("old")) == 0;
+            assert log.append(null, utf8("keep")) == 1;
+            assert log.append(utf8("a"), utf8("new")) == 2;
+            assert log.append(utf8("b"), utf8("old")) == 3;
+            assert log.append(utf8("b"), null) == 4;
+            assert log.append(utf8("a"), utf8("latest")) == 5;
+            assert log.append(null, utf8("active")) == 6;
+            log.compact();
+            List<PartitionLog.Record> remaining = log.readFrom(0);
+            assert remaining.stream().map(PartitionLog.Record::offset)
+                    .toList().equals(List.of(1L, 4L, 5L, 6L));
+            assert remaining.get(1).value() == null;
+            assert log.readFrom(3).get(0).offset() == 4;
+        }
+        assert Files.size(directory.resolve("compact/0.log")) > 0;
+        try (PartitionLog reopened = new PartitionLog(compactPath, 50)) {
+            assert reopened.readFrom(0).get(0).offset() == 1;
+            assert reopened.readFrom(4).get(0).value() == null;
+            assert reopened.append(null, utf8("after compaction")) == 7;
+        }
+
+        Path retentionPath = directory.resolve("retention.log");
+        Path retentionDirectory = directory.resolve("retention");
+        try (PartitionLog log = new PartitionLog(retentionPath, 1)) {
+            for (int offset = 0; offset < 5; offset++) {
+                assert log.append(null, utf8("v" + offset)) == offset;
+            }
+            long now = System.currentTimeMillis();
+            Files.setLastModifiedTime(retentionDirectory.resolve("0.log"),
+                    FileTime.fromMillis(now - 10_000));
+            Files.setLastModifiedTime(retentionDirectory.resolve("1.log"),
+                    FileTime.fromMillis(now - 10_000));
+            log.applyRetention(now, 1_000, -1);
+            assert !Files.exists(retentionDirectory.resolve("0.log"));
+            assert !Files.exists(retentionDirectory.resolve("1.index"));
+            assert log.readFrom(0).get(0).offset() == 2;
+            log.applyRetention(now, -1, 1);
+            assert log.readFrom(0).get(0).offset() == 4;
+            assert Files.exists(retentionDirectory.resolve("4.log"));
+        }
+        try (PartitionLog reopened = new PartitionLog(retentionPath, 1)) {
+            assert reopened.readFrom(0).get(0).offset() == 4;
+            assert reopened.append(null, utf8("next")) == 5;
+        }
+    }
+
     private static void rejectOversizedFrame(int port) throws IOException {
         try (Socket socket = new Socket("127.0.0.1", port);
              DataOutputStream output = new DataOutputStream(socket.getOutputStream())) {
@@ -396,11 +483,13 @@ public final class MiniKafka {
 
     private static void usage() {
         System.err.println("Usage:");
-        System.err.println("  MiniKafka broker <data-dir> [port] [segment-bytes]");
+        System.err.println("  MiniKafka broker <data-dir> [port] [segment-bytes] [retention-ms] [retention-bytes]");
         System.err.println("  MiniKafka create-topic <host> <port> <topic> <partitions>");
         System.err.println("  MiniKafka describe-topic <host> <port> <topic>");
         System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition]");
+        System.err.println("  MiniKafka delete <host> <port> <topic> <key> [partition]");
         System.err.println("  MiniKafka consume <host> <port> <topic> <partition> <offset>");
+        System.err.println("  MiniKafka compact <host> <port> <topic> <partition>");
         System.err.println("  MiniKafka self-test");
         System.exit(2);
     }
