@@ -44,9 +44,11 @@ public final class MiniKafka {
     }
 
     private static void runBroker(String[] args) throws IOException {
-        if (args.length < 2 || args.length > 3) usage();
-        int port = args.length == 3 ? parsePort(args[2]) : 9092;
-        try (Broker broker = new Broker(Path.of(args[1]), port)) {
+        if (args.length < 2 || args.length > 4) usage();
+        int port = args.length >= 3 ? parsePort(args[2]) : 9092;
+        long segmentBytes = args.length == 4 ? Long.parseLong(args[3])
+                : PartitionLog.DEFAULT_SEGMENT_BYTES;
+        try (Broker broker = new Broker(Path.of(args[1]), port, segmentBytes)) {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> closeQuietly(broker)));
             System.out.println("broker listening on port " + broker.port());
             broker.serve();
@@ -278,9 +280,9 @@ public final class MiniKafka {
 
             assert Files.readString(directory.resolve("orders").resolve("topic.meta"))
                     .trim().equals("3");
-            assert Files.isRegularFile(directory.resolve("orders").resolve("0.log"));
-            assert Files.isRegularFile(directory.resolve("orders").resolve("1.log"));
-            assert Files.isRegularFile(directory.resolve("orders").resolve("2.log"));
+            assert Files.isRegularFile(directory.resolve("orders/0/0.log"));
+            assert Files.isRegularFile(directory.resolve("orders/1/0.log"));
+            assert Files.isRegularFile(directory.resolve("orders/2/0.log"));
 
             AtomicReference<Throwable> restartFailure = new AtomicReference<>();
             Thread restartedThread;
@@ -298,6 +300,7 @@ public final class MiniKafka {
             restartedThread.join(2_000);
             assert !restartedThread.isAlive();
             if (restartFailure.get() != null) throw new AssertionError(restartFailure.get());
+            segmentSelfTest(directory);
             System.out.println("self-test passed");
         } finally {
             broker.close();
@@ -312,6 +315,67 @@ public final class MiniKafka {
                 });
             }
         }
+    }
+
+    private static void segmentSelfTest(Path directory) throws IOException {
+        Path legacyPath = directory.resolve("segments.log");
+        Path segmentDirectory = directory.resolve("segments");
+        try (PartitionLog log = new PartitionLog(legacyPath, 1_400)) {
+            for (int offset = 0; offset < 80; offset++) {
+                assert log.append(null, utf8("message-" + offset + "-" + "x".repeat(30))) == offset;
+            }
+            List<PartitionLog.Record> records = log.readFrom(25);
+            assert records.size() == 55;
+            assert records.get(0).offset() == 25;
+            assert records.get(54).offset() == 79;
+            assert log.readFrom(17).get(0).offset() == 17;
+            assert log.readFrom(79).get(0).offset() == 79;
+            assert log.readFrom(25, 300).size() == 4;
+        }
+
+        List<Path> segmentFiles;
+        try (var files = Files.list(segmentDirectory)) {
+            segmentFiles = files.filter(path -> path.toString().endsWith(".log"))
+                    .sorted(Comparator.comparingLong(path -> Long.parseLong(
+                            path.getFileName().toString().replace(".log", "")))).toList();
+        }
+        assert segmentFiles.size() > 1;
+        Path firstIndex = segmentDirectory.resolve("0.index");
+        assert Files.size(firstIndex) >= 32;
+        Files.write(firstIndex, new byte[] {1, 2, 3});
+
+        Path activeSegment = segmentFiles.get(segmentFiles.size() - 1);
+        long completeLength = Files.size(activeSegment);
+        Files.write(activeSegment, new byte[] {0, 1}, java.nio.file.StandardOpenOption.APPEND);
+        try (PartitionLog reopened = new PartitionLog(legacyPath, 1_400)) {
+            assert Files.size(firstIndex) >= 32;
+            assert Files.size(activeSegment) == completeLength;
+            assert reopened.readFrom(25).size() == 55;
+            assert reopened.append(null, utf8("after restart")) == 80;
+        }
+
+        Files.write(segmentFiles.get(0), new byte[] {0}, java.nio.file.StandardOpenOption.APPEND);
+        try {
+            new PartitionLog(legacyPath, 1_400).close();
+            throw new AssertionError("incomplete closed segment was accepted");
+        } catch (IOException expected) {
+            assert expected.getMessage().contains("incomplete closed segment");
+        }
+
+        Path originalPath = directory.resolve("legacy.log");
+        Path originalDirectory = directory.resolve("legacy");
+        try (PartitionLog old = new PartitionLog(originalPath)) {
+            assert old.append(null, utf8("old data")) == 0;
+        }
+        Files.move(originalDirectory.resolve("0.log"), originalPath);
+        Files.delete(originalDirectory.resolve("0.index"));
+        Files.delete(originalDirectory);
+        try (PartitionLog migrated = new PartitionLog(originalPath)) {
+            assert migrated.readFrom(0).size() == 1;
+            assert migrated.append(null, utf8("new data")) == 1;
+        }
+        assert Files.isRegularFile(originalDirectory.resolve("0.log"));
+        assert !Files.exists(originalPath);
     }
 
     private static void rejectOversizedFrame(int port) throws IOException {
@@ -332,7 +396,7 @@ public final class MiniKafka {
 
     private static void usage() {
         System.err.println("Usage:");
-        System.err.println("  MiniKafka broker <data-dir> [port]");
+        System.err.println("  MiniKafka broker <data-dir> [port] [segment-bytes]");
         System.err.println("  MiniKafka create-topic <host> <port> <topic> <partitions>");
         System.err.println("  MiniKafka describe-topic <host> <port> <topic>");
         System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition]");

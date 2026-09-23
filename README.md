@@ -6,7 +6,7 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 3 완료:** topic metadata와 여러 partition
+**Milestone 4 완료:** log segment와 sparse offset index
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
@@ -20,8 +20,10 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 - topic 생성과 영속적인 partition metadata
 - topic별 여러 partition과 독립 offset
 - 명시적 partition, key hash, null key round-robin 선택
+- partition별 segment 분할과 sparse index를 이용한 offset 검색
+- 재시작 시 segment 검증과 index 재구성
 
-아직 consumer group, replication, log segment/index는 없습니다.
+아직 consumer group, replication, retention은 없습니다.
 
 ## 빠른 실행
 
@@ -78,7 +80,8 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 │   └── milestones
 │       ├── 01-persistent-log.md
 │       ├── 02-tcp-broker.md
-│       └── 03-topics-partitions.md
+│       ├── 03-topics-partitions.md
+│       └── 04-segments-index.md
 └── src
     ├── Broker.java          # TCP 연결과 request 처리
     ├── MiniKafka.java       # CLI와 network client
@@ -88,9 +91,11 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 data/                       # 실행 시 생성되며 Git에는 포함하지 않음
 └── <topic>/
     ├── topic.meta          # partition 개수
-    ├── 0.log
-    ├── 1.log
-    └── ...                 # partition별 독립 append-only log
+    └── <partition>/
+        ├── 0.log           # base offset이 0인 segment
+        ├── 0.index         # (offset, 파일 내 위치) 쌍
+        ├── 123.log         # 다음 segment의 base offset 예시
+        └── 123.index
 ```
 
 Milestone 1의 단일 파일을 저장소, protocol, broker, client의 네 역할로 분리했습니다. 각 클래스는 아직 interface나 별도 계층 없이 한 가지 구현만 가집니다.
@@ -112,6 +117,18 @@ Milestone 1의 단일 파일을 저장소, protocol, broker, client의 네 역�
 
 현재 `fsync`를 매 append마다 호출합니다. 느리지만 첫 단계에서는 durability 동작을 명확하게 확인하기 위한 선택입니다. batching은 뒤 단계에서 측정 후 추가합니다.
 
+## Segment와 index
+
+partition 로그는 기본 1 MiB에 도달하면 다음 append 전에 새 segment를 엽니다. 한 레코드 때문에 실제 파일 크기가 기준을 조금 넘을 수 있습니다. 학습용으로 작은 크기를 실험하려면 broker 실행 시 마지막 인자를 지정합니다.
+
+```bash
+java -cp out MiniKafka broker data 9092 256
+```
+
+segment 파일 이름은 해당 파일의 첫 offset이며, 16개 레코드마다 `.index`에 `(offset, byte position)`을 기록합니다. fetch는 segment 목록과 index를 각각 이진 탐색한 뒤 최대 15개 레코드만 건너뛰고 요청한 위치부터 읽습니다. 응답 크기가 16 MiB를 넘기 전에 fetch를 끊으므로 뒤의 레코드는 다음 offset으로 다시 조회합니다.
+
+Milestone 3 형식인 `<partition>.log`는 처음 열 때 `<partition>/0.log`로 옮깁니다. 재시작 시 index는 로그를 검사하며 다시 만들기 때문에 시작 시간은 전체 레코드 수에 비례합니다.
+
 ## TCP frame 형식
 
 모든 request와 response 앞에는 뒤따르는 body 크기를 나타내는 4-byte 정수가 붙습니다.
@@ -128,6 +145,7 @@ response = frame size | correlation ID | status  | response payload
 - [Milestone 1 — 영속 append-only log](docs/milestones/01-persistent-log.md)
 - [Milestone 2 — TCP broker와 protocol](docs/milestones/02-tcp-broker.md)
 - [Milestone 3 — topic과 partition](docs/milestones/03-topics-partitions.md)
+- [Milestone 4 — log segment와 sparse index](docs/milestones/04-segments-index.md)
 
 ## 구현 순서
 
@@ -178,15 +196,17 @@ response = frame size | correlation ID | status  | response payload
 
 **완료 조건:** 같은 key는 항상 같은 partition으로 가고, 각 partition의 offset이 독립적으로 증가해야 합니다.
 
-### Milestone 4 — log segment와 sparse index
+완성된 코드는 Git tag `milestone-3`에서 확인할 수 있습니다.
+
+### Milestone 4 — log segment와 sparse index `[완료]`
 
 **배우는 것:** 로그 전체를 매번 스캔하지 않고 큰 데이터를 관리하는 방법
 
-- [ ] 설정한 크기에서 active segment 교체
-- [ ] segment 파일명을 base offset으로 관리
-- [ ] offset → file position sparse index
-- [ ] binary search로 대상 segment/index 탐색
-- [ ] 재시작 시 segment와 index 검증 및 복구
+- [x] 설정한 크기에서 active segment 교체
+- [x] segment 파일명을 base offset으로 관리
+- [x] offset → file position sparse index
+- [x] binary search로 대상 segment/index 탐색
+- [x] 재시작 시 segment와 index 검증 및 복구
 
 **완료 조건:** 여러 segment가 생성된 뒤에도 임의 offset fetch가 정확해야 하며, 전체 로그 선형 탐색 없이 대상 위치를 찾아야 합니다.
 

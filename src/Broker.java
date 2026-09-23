@@ -24,6 +24,7 @@ final class Broker implements AutoCloseable {
     private static final int MAX_PARTITIONS = 1_000;
 
     private final Path dataDirectory;
+    private final long segmentBytes;
     private final ServerSocket server;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
@@ -31,7 +32,13 @@ final class Broker implements AutoCloseable {
     private volatile boolean running = true;
 
     Broker(Path dataDirectory, int port) throws IOException {
+        this(dataDirectory, port, PartitionLog.DEFAULT_SEGMENT_BYTES);
+    }
+
+    Broker(Path dataDirectory, int port, long segmentBytes) throws IOException {
+        if (segmentBytes < 1) throw new IllegalArgumentException("segment size must be positive");
         this.dataDirectory = dataDirectory;
+        this.segmentBytes = segmentBytes;
         server = new ServerSocket(port);
     }
 
@@ -99,6 +106,10 @@ final class Broker implements AutoCloseable {
         byte[] key = Protocol.readBytes(input, true);
         byte[] value = Protocol.readBytes(input, false);
         Protocol.requireEnd(input);
+        long responseRecordBytes = 24L + (key == null ? 0 : key.length) + value.length;
+        if (responseRecordBytes > Protocol.MAX_FRAME_SIZE - 9) {
+            throw new IllegalArgumentException("record exceeds fetch frame limit");
+        }
         long offset = topic(topicName).log(partition).append(key, value);
 
         ByteArrayOutputStream bytes = success(correlationId);
@@ -115,8 +126,8 @@ final class Broker implements AutoCloseable {
         long offset = input.readLong();
         Protocol.requireEnd(input);
 
-        // ponytail: full-log fetch is enough for now; add byte limits with segmented logs.
-        List<PartitionLog.Record> records = topic(topicName).log(partition).readFrom(offset);
+        List<PartitionLog.Record> records = topic(topicName).log(partition)
+                .readFrom(offset, Protocol.MAX_FRAME_SIZE - 9);
         ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
             output.writeInt(records.size());
@@ -183,7 +194,7 @@ final class Broker implements AutoCloseable {
         } catch (FileAlreadyExistsException duplicate) {
             throw new IllegalArgumentException("topic already exists: " + name);
         }
-        topics.put(name, new Topic(directory, partitionCount));
+        topics.put(name, new Topic(directory, partitionCount, segmentBytes));
     }
 
     private synchronized Topic topic(String name) throws IOException {
@@ -204,7 +215,7 @@ final class Broker implements AutoCloseable {
             if (partitionCount < 1 || partitionCount > MAX_PARTITIONS) {
                 throw new IOException("invalid metadata for topic: " + name);
             }
-            Topic loaded = new Topic(directory, partitionCount);
+            Topic loaded = new Topic(directory, partitionCount, segmentBytes);
             topics.put(name, loaded);
             return loaded;
         } catch (NumberFormatException invalid) {
@@ -213,7 +224,9 @@ final class Broker implements AutoCloseable {
     }
 
     private static void validateTopicName(String topic) {
-        if (!topic.matches("[A-Za-z0-9._-]+")) throw new IllegalArgumentException("invalid topic name");
+        if (!topic.matches("[A-Za-z0-9._-]+") || topic.equals(".") || topic.equals("..")) {
+            throw new IllegalArgumentException("invalid topic name");
+        }
     }
 
     @Override
@@ -238,11 +251,13 @@ final class Broker implements AutoCloseable {
     private static final class Topic implements AutoCloseable {
         private final Path directory;
         private final int partitionCount;
+        private final long segmentBytes;
         private final Map<Integer, PartitionLog> logs = new HashMap<>();
 
-        Topic(Path directory, int partitionCount) {
+        Topic(Path directory, int partitionCount, long segmentBytes) {
             this.directory = directory;
             this.partitionCount = partitionCount;
+            this.segmentBytes = segmentBytes;
         }
 
         int partitionCount() {
@@ -257,7 +272,7 @@ final class Broker implements AutoCloseable {
             PartitionLog existing = logs.get(partition);
             if (existing != null) return existing;
 
-            PartitionLog created = new PartitionLog(directory.resolve(partition + ".log"));
+            PartitionLog created = new PartitionLog(directory.resolve(partition + ".log"), segmentBytes);
             logs.put(partition, created);
             return created;
         }
