@@ -12,6 +12,8 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,11 +30,15 @@ final class Broker implements AutoCloseable {
     private final long retentionMs;
     private final long retentionBytes;
     private final ConsumerGroups consumerGroups;
+    private final Cluster cluster;
+    private final int brokerId;
+    private final ReplicaProgress replicaProgress = new ReplicaProgress();
     private final ServerSocket server;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private final Map<String, Topic> topics = new HashMap<>();
     private volatile boolean running = true;
+    private Thread replicationThread;
 
     Broker(Path dataDirectory, int port) throws IOException {
         this(dataDirectory, port, PartitionLog.DEFAULT_SEGMENT_BYTES);
@@ -44,6 +50,17 @@ final class Broker implements AutoCloseable {
 
     Broker(Path dataDirectory, int port, long segmentBytes, long retentionMs,
             long retentionBytes) throws IOException {
+        this(dataDirectory, port, segmentBytes, retentionMs, retentionBytes, null, -1);
+    }
+
+    Broker(Path dataDirectory, Cluster cluster, int brokerId, long segmentBytes)
+            throws IOException {
+        this(dataDirectory, cluster.node(brokerId).port(), segmentBytes, -1, -1,
+                cluster, brokerId);
+    }
+
+    private Broker(Path dataDirectory, int port, long segmentBytes, long retentionMs,
+            long retentionBytes, Cluster cluster, int brokerId) throws IOException {
         if (segmentBytes < 1) throw new IllegalArgumentException("segment size must be positive");
         if (retentionMs < -1 || retentionBytes < -1) {
             throw new IllegalArgumentException("retention limits must be >= -1");
@@ -52,6 +69,20 @@ final class Broker implements AutoCloseable {
         this.segmentBytes = segmentBytes;
         this.retentionMs = retentionMs;
         this.retentionBytes = retentionBytes;
+        this.cluster = cluster;
+        this.brokerId = brokerId;
+        if (cluster != null) {
+            Files.createDirectories(dataDirectory);
+            Path identity = dataDirectory.resolve("broker.id");
+            if (Files.exists(identity)) {
+                if (!Files.readString(identity).trim().equals(Integer.toString(brokerId))) {
+                    throw new IOException("data directory belongs to a different broker");
+                }
+            } else {
+                Files.writeString(identity, Integer.toString(brokerId),
+                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+            }
+        }
         this.consumerGroups = new ConsumerGroups(dataDirectory);
         server = new ServerSocket(port);
     }
@@ -61,13 +92,29 @@ final class Broker implements AutoCloseable {
     }
 
     void serve() throws IOException {
-        while (running) {
-            try {
-                Socket client = server.accept();
-                clients.add(client);
-                workers.execute(() -> handle(client));
-            } catch (SocketException closed) {
-                if (running) throw closed;
+        if (cluster != null && brokerId != 0) {
+            replicationThread = new Thread(this::replicateLoop, "replica-" + brokerId);
+            replicationThread.setDaemon(true);
+            replicationThread.start();
+        }
+        try {
+            while (running) {
+                try {
+                    Socket client = server.accept();
+                    clients.add(client);
+                    workers.execute(() -> handle(client));
+                } catch (SocketException closed) {
+                    if (running) throw closed;
+                }
+            }
+        } finally {
+            if (replicationThread != null) {
+                replicationThread.interrupt();
+                try {
+                    replicationThread.join(3_000);
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
@@ -83,7 +130,8 @@ final class Broker implements AutoCloseable {
                 } catch (EOFException disconnected) {
                     return;
                 }
-                Protocol.writeFrame(output, respond(request));
+                byte[] response = respond(request);
+                if (response != null) Protocol.writeFrame(output, response);
             }
         } catch (Protocol.ProtocolException rejected) {
             // Invalid or oversized frames are rejected by closing the connection.
@@ -110,6 +158,9 @@ final class Broker implements AutoCloseable {
                     case Protocol.LEAVE_GROUP -> leaveGroup(correlationId, input);
                     case Protocol.COMMIT_OFFSET -> commitOffset(correlationId, input);
                     case Protocol.FETCH_OFFSET -> fetchOffset(correlationId, input);
+                    case Protocol.REPLICA_TOPICS -> replicaTopics(correlationId, input);
+                    case Protocol.REPLICA_FETCH -> replicaFetch(correlationId, input);
+                    case Protocol.REPLICA_STATUS -> replicaStatus(correlationId, input);
                     default -> error(correlationId, Protocol.INVALID_REQUEST, "unknown api key: " + apiKey);
                 };
             } catch (IllegalArgumentException | EOFException | Protocol.ProtocolException invalid) {
@@ -125,7 +176,13 @@ final class Broker implements AutoCloseable {
         int partition = input.readInt();
         byte[] key = Protocol.readBytes(input, true);
         byte[] value = Protocol.readBytes(input, true);
+        byte acks = input.readByte();
         Protocol.requireEnd(input);
+        requireLeader();
+        if (acks != Protocol.ACKS_NONE && acks != Protocol.ACKS_LEADER
+                && acks != Protocol.ACKS_ALL) {
+            throw new IllegalArgumentException("acks must be 0, 1, or all");
+        }
         if (key == null && value == null) {
             throw new IllegalArgumentException("tombstone requires a key");
         }
@@ -135,11 +192,19 @@ final class Broker implements AutoCloseable {
             throw new IllegalArgumentException("record exceeds fetch frame limit");
         }
         PartitionLog log = topic(topicName).log(partition);
+        if (cluster != null && acks == Protocol.ACKS_ALL
+                && !replicaProgress.allFollowersAt(topicName, partition, log.endOffset())) {
+            throw new IllegalArgumentException("not all replicas are in sync");
+        }
         long offset = log.append(key, value);
         if (retentionMs >= 0 || retentionBytes >= 0) {
             // ponytail: scan on append; schedule periodic cleanup if many segments make this costly.
             log.applyRetention(System.currentTimeMillis(), retentionMs, retentionBytes);
         }
+        if (cluster != null && acks == Protocol.ACKS_ALL) {
+            replicaProgress.awaitAll(topicName, partition, offset + 1);
+        }
+        if (acks == Protocol.ACKS_NONE) return null;
 
         ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
@@ -159,18 +224,24 @@ final class Broker implements AutoCloseable {
                 .readFrom(offset, Protocol.MAX_FRAME_SIZE - 9);
         ByteArrayOutputStream bytes = success(correlationId);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(records.size());
-            for (PartitionLog.Record record : records) {
-                output.writeLong(record.offset());
-                output.writeLong(record.timestamp());
-                Protocol.writeNullableBytes(output, record.key());
-                Protocol.writeNullableBytes(output, record.value());
-            }
+            writeRecords(output, records);
         }
         return bytes.toByteArray();
     }
 
+    private static void writeRecords(DataOutputStream output, List<PartitionLog.Record> records)
+            throws IOException {
+        output.writeInt(records.size());
+        for (PartitionLog.Record record : records) {
+            output.writeLong(record.offset());
+            output.writeLong(record.timestamp());
+            Protocol.writeNullableBytes(output, record.key());
+            Protocol.writeNullableBytes(output, record.value());
+        }
+    }
+
     private byte[] createTopic(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String topic = Protocol.readString(input);
         int partitions = input.readInt();
         Protocol.requireEnd(input);
@@ -194,11 +265,13 @@ final class Broker implements AutoCloseable {
         String topicName = Protocol.readString(input);
         int partition = input.readInt();
         Protocol.requireEnd(input);
+        if (cluster != null) throw new IllegalArgumentException("compaction is standalone-only for now");
         topic(topicName).log(partition).compact();
         return success(correlationId).toByteArray();
     }
 
     private byte[] joinGroup(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String groupId = Protocol.readString(input);
         String topicName = Protocol.readString(input);
         Protocol.requireEnd(input);
@@ -208,6 +281,7 @@ final class Broker implements AutoCloseable {
     }
 
     private byte[] heartbeat(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String groupId = Protocol.readString(input);
         String topicName = Protocol.readString(input);
         String memberId = Protocol.readString(input);
@@ -218,6 +292,7 @@ final class Broker implements AutoCloseable {
     }
 
     private byte[] leaveGroup(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String groupId = Protocol.readString(input);
         String topicName = Protocol.readString(input);
         String memberId = Protocol.readString(input);
@@ -228,6 +303,7 @@ final class Broker implements AutoCloseable {
     }
 
     private byte[] commitOffset(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String groupId = Protocol.readString(input);
         String topicName = Protocol.readString(input);
         String memberId = Protocol.readString(input);
@@ -241,6 +317,7 @@ final class Broker implements AutoCloseable {
     }
 
     private byte[] fetchOffset(int correlationId, DataInputStream input) throws IOException {
+        requireLeader();
         String groupId = Protocol.readString(input);
         String topicName = Protocol.readString(input);
         int partition = input.readInt();
@@ -251,6 +328,129 @@ final class Broker implements AutoCloseable {
             output.writeLong(consumerGroups.fetchOffset(groupId, topicName, partition));
         }
         return bytes.toByteArray();
+    }
+
+    private byte[] replicaTopics(int correlationId, DataInputStream input) throws IOException {
+        requireClusterLeader();
+        Protocol.requireEnd(input);
+        List<String> names = new ArrayList<>();
+        if (Files.isDirectory(dataDirectory)) {
+            try (var entries = Files.list(dataDirectory)) {
+                for (Path path : entries.toList()) {
+                    if (Files.isRegularFile(path.resolve("topic.meta"))) {
+                        names.add(path.getFileName().toString());
+                    }
+                }
+            }
+        }
+        names.sort(Comparator.naturalOrder());
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            output.writeInt(names.size());
+            for (String name : names) {
+                Protocol.writeString(output, name);
+                output.writeInt(topic(name).partitionCount());
+            }
+        }
+        return bytes.toByteArray();
+    }
+
+    private byte[] replicaFetch(int correlationId, DataInputStream input) throws IOException {
+        requireClusterLeader();
+        int followerId = input.readInt();
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
+        long nextOffset = input.readLong();
+        Protocol.requireEnd(input);
+        if (followerId < 1 || followerId > 2 || nextOffset < 0) {
+            throw new IllegalArgumentException("invalid follower fetch");
+        }
+        PartitionLog log = topic(topicName).log(partition);
+        long leaderEnd = log.endOffset();
+        if (nextOffset > leaderEnd) {
+            throw new IllegalArgumentException("follower is ahead of leader");
+        }
+        replicaProgress.report(topicName, partition, followerId, nextOffset);
+        List<PartitionLog.Record> records = log.readFrom(nextOffset, Protocol.MAX_FRAME_SIZE - 17);
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            output.writeLong(leaderEnd);
+            writeRecords(output, records);
+        }
+        return bytes.toByteArray();
+    }
+
+    private byte[] replicaStatus(int correlationId, DataInputStream input) throws IOException {
+        requireClusterLeader();
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
+        Protocol.requireEnd(input);
+        long leaderEnd = topic(topicName).log(partition).endOffset();
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            output.writeInt(0); // fixed leader broker ID
+            output.writeLong(leaderEnd);
+            for (int id = 1; id <= 2; id++) {
+                long followerEnd = replicaProgress.endOffset(topicName, partition, id);
+                output.writeLong(followerEnd);
+                output.writeBoolean(replicaProgress.inSync(topicName, partition, id, leaderEnd));
+            }
+        }
+        return bytes.toByteArray();
+    }
+
+    private void requireLeader() {
+        if (cluster != null && brokerId != cluster.leaderId("", 0)) {
+            throw new IllegalArgumentException("not leader; use broker 0 at "
+                    + cluster.node(0).host() + ":" + cluster.node(0).port());
+        }
+    }
+
+    private void requireClusterLeader() {
+        if (cluster == null) throw new IllegalArgumentException("not running in cluster mode");
+        requireLeader();
+    }
+
+    private void replicateLoop() {
+        String lastError = null;
+        while (running) {
+            try {
+                Cluster.Node leader = cluster.node(0);
+                for (ReplicaClient.TopicInfo info : ReplicaClient.topics(leader)) {
+                    if (!running) return;
+                    ensureReplicaTopic(info.name(), info.partitions());
+                    for (int partition = 0; partition < info.partitions(); partition++) {
+                        PartitionLog log = topic(info.name()).log(partition);
+                        ReplicaClient.Batch batch = ReplicaClient.fetch(leader, brokerId,
+                                info.name(), partition, log.endOffset());
+                        for (PartitionLog.Record record : batch.records()) log.appendReplica(record);
+                    }
+                }
+                lastError = null;
+            } catch (IOException | RuntimeException failure) {
+                if (running && !failure.toString().equals(lastError)) {
+                    System.err.println("replica " + brokerId + ": " + failure.getMessage());
+                    lastError = failure.toString();
+                }
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private synchronized void ensureReplicaTopic(String name, int partitionCount) throws IOException {
+        Path metadata = dataDirectory.resolve(name).resolve("topic.meta");
+        if (Files.exists(metadata)) {
+            if (topic(name).partitionCount() != partitionCount) {
+                throw new IOException("replica topic metadata mismatch: " + name);
+            }
+        } else {
+            createTopic(name, partitionCount);
+        }
     }
 
     private static byte[] assignmentResponse(int correlationId,
@@ -347,6 +547,7 @@ final class Broker implements AutoCloseable {
         server.close();
         for (Socket client : clients) client.close();
         workers.shutdownNow();
+        if (replicationThread != null) replicationThread.interrupt();
 
         IOException failure = null;
         for (Topic topic : topics.values()) {

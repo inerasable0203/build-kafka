@@ -6,7 +6,7 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 6 완료:** consumer offset과 consumer group
+**Milestone 7 완료:** 3-broker leader/follower replication
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
@@ -25,8 +25,10 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 - 시간·용량 기준으로 오래된 closed segment 삭제
 - key별 오래된 값을 정리하는 compaction과 tombstone
 - group별 다음 읽을 offset 저장, heartbeat, 파티션 배정과 재배정
+- 고정 leader와 두 follower 사이의 topic·partition 로그 복제
+- follower end offset·lag·간이 ISR 확인, `acks=0/1/all` 실습
 
-아직 replication은 없습니다.
+자동 leader 선출과 장애 전환은 아직 없습니다(Milestone 8).
 
 ## 빠른 실행
 
@@ -88,11 +90,34 @@ java -cp out MiniKafka group-offset 127.0.0.1 9092 workers orders 1
 
 partition을 생략하면 key가 있는 레코드는 key hash로 partition을 정합니다. null key(`-`)는 같은 producer 프로세스 안에서 round-robin으로 선택합니다. 이 CLI는 명령마다 새 프로세스이므로 여러 null-key 명령의 분산을 관찰하려면 이후 장기 실행 producer 또는 self-test를 사용해야 합니다.
 
+## 3-broker 복제 실행
+
+각각 다른 터미널에서 아래 broker를 실행합니다. 각 broker는 **서로 다른 데이터 디렉터리**를 사용합니다. `config/cluster.properties`의 포트는 9100·9101·9102이며 broker 0이 모든 파티션의 고정 leader입니다.
+
+```bash
+java -cp out MiniKafka cluster-broker config/cluster.properties 0 data/cluster-0
+java -cp out MiniKafka cluster-broker config/cluster.properties 1 data/cluster-1
+java -cp out MiniKafka cluster-broker config/cluster.properties 2 data/cluster-2
+```
+
+다른 터미널에서 leader에 토픽을 만들고 레코드를 씁니다. `replica-status`에서 두 follower가 `in-sync=true`인지 먼저 확인하세요.
+
+```bash
+java -cp out MiniKafka create-topic 127.0.0.1 9100 replicated-cars 2
+java -cp out MiniKafka replica-status 127.0.0.1 9100 replicated-cars 0
+java -cp out MiniKafka produce 127.0.0.1 9100 replicated-cars car-1 "speed=50" 0 all
+java -cp out MiniKafka consume 127.0.0.1 9101 replicated-cars 0 0
+```
+
+`acks=all`은 leader와 두 follower가 기록할 때까지 기다립니다. `acks=1`은 leader 기록 후, `acks=0`은 응답을 기다리지 않고 돌아옵니다. 현재 `acks=all`은 기록 후 5초 내 복제되지 않으면 오류를 돌려주지만 leader에는 이미 기록됐을 수 있습니다. 자세한 실습과 한계는 [Milestone 7 문서](docs/milestones/07-replication.md)에 있습니다.
+
 ## 현재 구조
 
 ```text
 .
 ├── README.md
+├── config
+│   └── cluster.properties
 ├── docs
 │   └── milestones
 │       ├── 01-persistent-log.md
@@ -100,13 +125,17 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 │       ├── 03-topics-partitions.md
 │       ├── 04-segments-index.md
 │       ├── 05-retention-compaction.md
-│       └── 06-consumer-groups.md
+│       ├── 06-consumer-groups.md
+│       └── 07-replication.md
 └── src
     ├── Broker.java          # TCP 연결과 request 처리
+    ├── Cluster.java         # 정적 3-broker metadata
     ├── ConsumerGroups.java  # membership, assignment, offset 저장
     ├── MiniKafka.java       # CLI와 network client
     ├── PartitionLog.java    # append-only disk log
-    └── Protocol.java        # binary frame과 자료형 encoding
+    ├── Protocol.java        # binary frame과 자료형 encoding
+    ├── ReplicaClient.java   # follower의 leader fetch
+    └── ReplicaProgress.java # leader의 follower 진행 상태
 
 data/                       # 실행 시 생성되며 Git에는 포함하지 않음
 └── <topic>/
@@ -175,7 +204,7 @@ request  = frame size | correlation ID | API key | API payload
 response = frame size | correlation ID | status  | response payload
 ```
 
-현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`, `COMPACT`, `JOIN_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `COMMIT_OFFSET`, `FETCH_OFFSET`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
+현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`, `COMPACT`, `JOIN_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `COMMIT_OFFSET`, `FETCH_OFFSET`, `REPLICA_TOPICS`, `REPLICA_FETCH`, `REPLICA_STATUS`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
 
 ## 마일스톤 문서
 
@@ -185,6 +214,7 @@ response = frame size | correlation ID | status  | response payload
 - [Milestone 4 — log segment와 sparse index](docs/milestones/04-segments-index.md)
 - [Milestone 5 — retention과 log compaction](docs/milestones/05-retention-compaction.md)
 - [Milestone 6 — consumer offset과 group](docs/milestones/06-consumer-groups.md)
+- [Milestone 7 — leader/follower replication](docs/milestones/07-replication.md)
 
 ## 구현 순서
 
@@ -276,18 +306,22 @@ response = frame size | correlation ID | status  | response payload
 
 **완료 조건:** 같은 group의 consumer들은 partition을 나눠 처리하고, 다른 group은 동일한 레코드를 독립적으로 읽어야 합니다. 재시작한 consumer는 committed offset부터 이어서 읽어야 합니다.
 
-### Milestone 7 — replication
+완성된 코드는 Git tag `milestone-6`에서 확인할 수 있습니다.
+
+### Milestone 7 — replication `[완료]`
 
 **배우는 것:** partition leader와 follower가 동일한 순서의 로그를 유지하는 방식
 
-- [ ] broker id와 cluster metadata
-- [ ] partition별 leader/follower 역할
-- [ ] follower fetch와 로그 복제
-- [ ] leader end offset과 follower lag 추적
-- [ ] ISR(in-sync replicas)의 단순화된 모델
-- [ ] `acks=0`, `acks=1`, `acks=all`
+- [x] broker id와 cluster metadata
+- [x] partition별 leader/follower 역할(모든 partition의 leader는 broker 0으로 고정)
+- [x] follower fetch와 로그 복제
+- [x] leader end offset과 follower lag 추적
+- [x] ISR(in-sync replicas)의 단순화된 모델
+- [x] `acks=0`, `acks=1`, `acks=all`
 
 **완료 조건:** replication factor 3에서 leader에 쓴 레코드가 follower에 같은 offset과 순서로 복제되어야 합니다.
+
+완성된 코드는 Git tag `milestone-7`에서 확인할 수 있습니다.
 
 ### Milestone 8 — controller와 failover
 

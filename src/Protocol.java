@@ -14,6 +14,12 @@ final class Protocol {
     static final byte LEAVE_GROUP = 8;
     static final byte COMMIT_OFFSET = 9;
     static final byte FETCH_OFFSET = 10;
+    static final byte REPLICA_TOPICS = 11;
+    static final byte REPLICA_FETCH = 12;
+    static final byte REPLICA_STATUS = 13;
+    static final byte ACKS_NONE = 0;
+    static final byte ACKS_LEADER = 1;
+    static final byte ACKS_ALL = 2;
     static final byte OK = 0;
     static final byte INVALID_REQUEST = 1;
     static final byte SERVER_ERROR = 2;

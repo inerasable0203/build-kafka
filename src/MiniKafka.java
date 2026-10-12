@@ -5,6 +5,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,6 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class MiniKafka {
     record ProduceResult(int partition, long offset) {}
+    record ReplicaState(int brokerId, long endOffset, long lag, boolean inSync) {}
+    record ReplicaStatus(int leaderId, long leaderEnd, List<ReplicaState> followers) {}
 
     private static final AtomicInteger CORRELATION_IDS = new AtomicInteger();
     private static final ConcurrentMap<String, AtomicInteger> ROUND_ROBINS =
@@ -37,6 +40,7 @@ public final class MiniKafka {
 
         switch (args[0]) {
             case "broker" -> runBroker(args);
+            case "cluster-broker" -> runClusterBroker(args);
             case "create-topic" -> createTopicCommand(args);
             case "describe-topic" -> describeTopicCommand(args);
             case "produce" -> produceCommand(args);
@@ -45,6 +49,7 @@ public final class MiniKafka {
             case "consume-group" -> consumeGroupCommand(args);
             case "group-offset" -> groupOffsetCommand(args);
             case "compact" -> compactCommand(args);
+            case "replica-status" -> replicaStatusCommand(args);
             default -> usage();
         }
     }
@@ -64,6 +69,19 @@ public final class MiniKafka {
         }
     }
 
+    private static void runClusterBroker(String[] args) throws IOException {
+        if (args.length < 4 || args.length > 5) usage();
+        Cluster cluster = Cluster.read(Path.of(args[1]));
+        int brokerId = Integer.parseInt(args[2]);
+        long segmentBytes = args.length == 5 ? Long.parseLong(args[4])
+                : PartitionLog.DEFAULT_SEGMENT_BYTES;
+        try (Broker broker = new Broker(Path.of(args[3]), cluster, brokerId, segmentBytes)) {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> closeQuietly(broker)));
+            System.out.printf("broker %d listening on port %d%n", brokerId, broker.port());
+            broker.serve();
+        }
+    }
+
     private static void createTopicCommand(String[] args) throws IOException {
         if (args.length != 5) usage();
         int partitions = Integer.parseInt(args[4]);
@@ -78,26 +96,55 @@ public final class MiniKafka {
     }
 
     private static void produceCommand(String[] args) throws IOException {
-        if (args.length < 6 || args.length > 7) usage();
+        if (args.length < 6 || args.length > 8) usage();
         byte[] key = args[4].equals("-") ? null : utf8(args[4]);
-        Integer partition = args.length == 7 ? parsePartition(args[6]) : null;
+        Integer partition = args.length >= 7 && !args[6].equals("-")
+                ? parsePartition(args[6]) : null;
+        byte acks = args.length == 8 ? parseAcks(args[7]) : Protocol.ACKS_LEADER;
         ProduceResult result =
-                produce(args[1], parsePort(args[2]), args[3], key, utf8(args[5]), partition);
-        System.out.printf("partition=%d offset=%d%n", result.partition(), result.offset());
+                produce(args[1], parsePort(args[2]), args[3], key, utf8(args[5]), partition, acks);
+        printProduceResult(result);
     }
 
     private static void deleteCommand(String[] args) throws IOException {
-        if (args.length < 5 || args.length > 6 || args[4].equals("-")) usage();
-        Integer partition = args.length == 6 ? parsePartition(args[5]) : null;
+        if (args.length < 5 || args.length > 7 || args[4].equals("-")) usage();
+        Integer partition = args.length >= 6 && !args[5].equals("-")
+                ? parsePartition(args[5]) : null;
+        byte acks = args.length == 7 ? parseAcks(args[6]) : Protocol.ACKS_LEADER;
         ProduceResult result = produce(args[1], parsePort(args[2]), args[3],
-                utf8(args[4]), null, partition);
-        System.out.printf("partition=%d offset=%d tombstone%n", result.partition(), result.offset());
+                utf8(args[4]), null, partition, acks);
+        printProduceResult(result);
+    }
+
+    private static void printProduceResult(ProduceResult result) {
+        if (result.offset() < 0) System.out.printf("partition=%d sent without ack%n", result.partition());
+        else System.out.printf("partition=%d offset=%d%n", result.partition(), result.offset());
+    }
+
+    private static byte parseAcks(String value) {
+        return switch (value) {
+            case "0" -> Protocol.ACKS_NONE;
+            case "1" -> Protocol.ACKS_LEADER;
+            case "all" -> Protocol.ACKS_ALL;
+            default -> throw new IllegalArgumentException("acks must be 0, 1, or all");
+        };
     }
 
     private static void compactCommand(String[] args) throws IOException {
         if (args.length != 5) usage();
         compact(args[1], parsePort(args[2]), args[3], parsePartition(args[4]));
         System.out.println("compaction complete");
+    }
+
+    private static void replicaStatusCommand(String[] args) throws IOException {
+        if (args.length != 5) usage();
+        ReplicaStatus status = replicaStatus(args[1], parsePort(args[2]), args[3],
+                parsePartition(args[4]));
+        System.out.printf("leader=%d end=%d%n", status.leaderId(), status.leaderEnd());
+        for (ReplicaState follower : status.followers()) {
+            System.out.printf("follower=%d end=%d lag=%d in-sync=%s%n", follower.brokerId(),
+                    follower.endOffset(), follower.lag(), follower.inSync());
+        }
     }
 
     private static void consumeCommand(String[] args) throws IOException {
@@ -217,6 +264,11 @@ public final class MiniKafka {
     static ProduceResult produce(
             String host, int port, String topic, byte[] key, byte[] value, Integer explicitPartition)
             throws IOException {
+        return produce(host, port, topic, key, value, explicitPartition, Protocol.ACKS_LEADER);
+    }
+
+    static ProduceResult produce(String host, int port, String topic, byte[] key, byte[] value,
+            Integer explicitPartition, byte acks) throws IOException {
         int partition = explicitPartition != null
                 ? explicitPartition
                 : choosePartition(host, port, topic, key);
@@ -227,6 +279,12 @@ public final class MiniKafka {
             output.writeInt(partition);
             Protocol.writeNullableBytes(output, key);
             Protocol.writeNullableBytes(output, value);
+            output.writeByte(acks);
+        }
+
+        if (acks == Protocol.ACKS_NONE) {
+            sendOnly(host, port, bytes.toByteArray());
+            return new ProduceResult(partition, -1);
         }
 
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
@@ -251,22 +309,54 @@ public final class MiniKafka {
         }
 
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
-            int count = response.readInt();
-            int minimumRecordSize = Long.BYTES * 2 + Integer.BYTES * 2;
-            if (count < 0 || count > response.available() / minimumRecordSize) {
-                throw new Protocol.ProtocolException("invalid record count");
-            }
-
-            List<PartitionLog.Record> records = new ArrayList<>(count);
-            for (int index = 0; index < count; index++) {
-                long recordOffset = response.readLong();
-                long timestamp = response.readLong();
-                byte[] key = Protocol.readBytes(response, true);
-                byte[] value = Protocol.readBytes(response, true);
-                records.add(new PartitionLog.Record(recordOffset, timestamp, key, value));
-            }
+            List<PartitionLog.Record> records = readRecords(response);
             Protocol.requireEnd(response);
             return records;
+        }
+    }
+
+    static List<PartitionLog.Record> readRecords(DataInputStream response) throws IOException {
+        int count = response.readInt();
+        int minimumRecordSize = Long.BYTES * 2 + Integer.BYTES * 2;
+        if (count < 0 || count > response.available() / minimumRecordSize) {
+            throw new Protocol.ProtocolException("invalid record count");
+        }
+        List<PartitionLog.Record> records = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            long recordOffset = response.readLong();
+            long timestamp = response.readLong();
+            byte[] key = Protocol.readBytes(response, true);
+            byte[] value = Protocol.readBytes(response, true);
+            records.add(new PartitionLog.Record(recordOffset, timestamp, key, value));
+        }
+        return records;
+    }
+
+    static ReplicaStatus replicaStatus(String host, int port, String topic, int partition)
+            throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.REPLICA_STATUS);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, topic);
+            output.writeInt(partition);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            int leaderId = response.readInt();
+            long leaderEnd = response.readLong();
+            if (leaderId != 0 || leaderEnd < 0) {
+                throw new Protocol.ProtocolException("invalid replica status");
+            }
+            List<ReplicaState> followers = new ArrayList<>();
+            for (int id = 1; id <= 2; id++) {
+                long end = response.readLong();
+                boolean inSync = response.readBoolean();
+                if (end < -1 || end > leaderEnd) {
+                    throw new Protocol.ProtocolException("invalid follower offset");
+                }
+                followers.add(new ReplicaState(id, end, end < 0 ? -1 : leaderEnd - end, inSync));
+            }
+            Protocol.requireEnd(response);
+            return new ReplicaStatus(leaderId, leaderEnd, List.copyOf(followers));
         }
     }
 
@@ -389,7 +479,7 @@ public final class MiniKafka {
                 partitions);
     }
 
-    private static ByteArrayOutputStream request(int correlationId, byte apiKey) throws IOException {
+    static ByteArrayOutputStream request(int correlationId, byte apiKey) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         DataOutputStream output = new DataOutputStream(bytes);
         output.writeInt(correlationId);
@@ -397,11 +487,11 @@ public final class MiniKafka {
         return bytes;
     }
 
-    private static DataInputStream exchange(
+    static DataInputStream exchange(
             String host, int port, byte[] request, int correlationId) throws IOException {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 3_000);
-            socket.setSoTimeout(5_000);
+            socket.setSoTimeout(10_000);
             DataOutputStream output = new DataOutputStream(socket.getOutputStream());
             Protocol.writeFrame(output, request);
 
@@ -414,6 +504,13 @@ public final class MiniKafka {
             byte status = response.readByte();
             if (status != Protocol.OK) throw new IOException(Protocol.readString(response));
             return response;
+        }
+    }
+
+    private static void sendOnly(String host, int port, byte[] request) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), 3_000);
+            Protocol.writeFrame(new DataOutputStream(socket.getOutputStream()), request);
         }
     }
 
@@ -524,6 +621,7 @@ public final class MiniKafka {
             segmentSelfTest(directory);
             retentionCompactionSelfTest(directory);
             groupTimeoutSelfTest(directory);
+            replicationSelfTest(directory.resolve("replication"));
             System.out.println("self-test passed");
         } finally {
             broker.close();
@@ -595,6 +693,111 @@ public final class MiniKafka {
         }
         ConsumerGroups.Assignment replacement = groups.join("timeout", "orders", 3);
         assert replacement.partitions().equals(List.of(0, 1, 2));
+    }
+
+    private static void replicationSelfTest(Path directory) throws Exception {
+        Files.createDirectories(directory);
+        int[] ports = new int[3];
+        ServerSocket[] reservations = new ServerSocket[3];
+        try {
+            for (int id = 0; id < 3; id++) {
+                reservations[id] = new ServerSocket(0);
+                ports[id] = reservations[id].getLocalPort();
+            }
+        } finally {
+            for (ServerSocket reservation : reservations) {
+                if (reservation != null) reservation.close();
+            }
+        }
+        Path config = directory.resolve("cluster.properties");
+        Files.writeString(config, "broker.0=127.0.0.1:" + ports[0] + "\n"
+                + "broker.1=127.0.0.1:" + ports[1] + "\n"
+                + "broker.2=127.0.0.1:" + ports[2] + "\n");
+        Cluster cluster = Cluster.read(config);
+        Broker[] brokers = new Broker[3];
+        Thread[] threads = new Thread[3];
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try {
+            for (int id = 0; id < 3; id++) {
+                brokers[id] = new Broker(directory.resolve("broker-" + id), cluster, id, 256);
+                threads[id] = startBroker(brokers[id], "replica-self-test-" + id, failure);
+            }
+            String host = "127.0.0.1";
+            createTopic(host, ports[0], "replicated", 2);
+            waitForReplicas(ports[0], "replicated", 0, 0);
+            assert produce(host, ports[0], "replicated", utf8("car"), utf8("first"), 0,
+                    Protocol.ACKS_ALL).offset() == 0;
+            assert produce(host, ports[0], "replicated", utf8("car"), utf8("second"), 0,
+                    Protocol.ACKS_LEADER).offset() == 1;
+            produce(host, ports[0], "replicated", utf8("car"), utf8("third"), 0,
+                    Protocol.ACKS_NONE);
+            waitForReplicas(ports[0], "replicated", 0, 3);
+            List<PartitionLog.Record> leaderRecords = fetch(host, ports[0], "replicated", 0, 0);
+            assert leaderRecords.size() == 3;
+            for (int id = 1; id <= 2; id++) {
+                List<PartitionLog.Record> replicaRecords = fetch(host, ports[id], "replicated", 0, 0);
+                assert replicaRecords.size() == 3;
+                for (int index = 0; index < 3; index++) {
+                    assert replicaRecords.get(index).offset() == leaderRecords.get(index).offset();
+                    assert replicaRecords.get(index).timestamp() == leaderRecords.get(index).timestamp();
+                    assert Arrays.equals(replicaRecords.get(index).value(),
+                            leaderRecords.get(index).value());
+                }
+            }
+
+            brokers[2].close();
+            threads[2].join(3_000);
+            assert !threads[2].isAlive();
+            createTopic(host, ports[0], "while-offline", 1);
+            try {
+                produce(host, ports[0], "while-offline", utf8("car"), utf8("blocked"), 0,
+                        Protocol.ACKS_ALL);
+                throw new AssertionError("acks=all accepted an offline replica");
+            } catch (IOException expected) {
+                assert expected.getMessage().contains("not all replicas are in sync");
+            }
+            assert produce(host, ports[0], "while-offline", utf8("car"), utf8("accepted"), 0,
+                    Protocol.ACKS_LEADER).offset() == 0;
+            brokers[2] = new Broker(directory.resolve("broker-2"), cluster, 2, 256);
+            threads[2] = startBroker(brokers[2], "replica-restart-test", failure);
+            waitForReplicas(ports[0], "while-offline", 0, 1);
+            assert new String(fetch(host, ports[2], "while-offline", 0, 0).get(0).value(),
+                    StandardCharsets.UTF_8).equals("accepted");
+        } finally {
+            for (Broker broker : brokers) if (broker != null) broker.close();
+            for (Thread thread : threads) {
+                if (thread != null) {
+                    thread.join(4_000);
+                    assert !thread.isAlive();
+                }
+            }
+        }
+        if (failure.get() != null) throw new AssertionError(failure.get());
+    }
+
+    private static Thread startBroker(Broker broker, String name,
+            AtomicReference<Throwable> failure) {
+        Thread thread = new Thread(() -> {
+            try {
+                broker.serve();
+            } catch (Throwable error) {
+                failure.compareAndSet(null, error);
+            }
+        }, name);
+        thread.start();
+        return thread;
+    }
+
+    private static void waitForReplicas(int leaderPort, String topic, int partition, long minimumEnd)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + 8_000;
+        while (System.currentTimeMillis() < deadline) {
+            ReplicaStatus status = replicaStatus("127.0.0.1", leaderPort, topic, partition);
+            if (status.leaderEnd() >= minimumEnd
+                    && status.followers().stream().allMatch(ReplicaState::inSync)) return;
+            Thread.sleep(50);
+        }
+        throw new AssertionError("followers did not catch up: " + topic + "/" + partition);
     }
 
     private static void segmentSelfTest(Path directory) throws IOException {
@@ -726,14 +929,16 @@ public final class MiniKafka {
     private static void usage() {
         System.err.println("Usage:");
         System.err.println("  MiniKafka broker <data-dir> [port] [segment-bytes] [retention-ms] [retention-bytes]");
+        System.err.println("  MiniKafka cluster-broker <config> <broker-id> <data-dir> [segment-bytes]");
         System.err.println("  MiniKafka create-topic <host> <port> <topic> <partitions>");
         System.err.println("  MiniKafka describe-topic <host> <port> <topic>");
-        System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition]");
-        System.err.println("  MiniKafka delete <host> <port> <topic> <key> [partition]");
+        System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition|-] [acks:0|1|all]");
+        System.err.println("  MiniKafka delete <host> <port> <topic> <key> [partition|-] [acks:0|1|all]");
         System.err.println("  MiniKafka consume <host> <port> <topic> <partition> <offset>");
         System.err.println("  MiniKafka consume-group <host> <port> <group> <topic> [polls]");
         System.err.println("  MiniKafka group-offset <host> <port> <group> <topic> <partition>");
         System.err.println("  MiniKafka compact <host> <port> <topic> <partition>");
+        System.err.println("  MiniKafka replica-status <host> <port> <topic> <partition>");
         System.err.println("  MiniKafka self-test");
         System.exit(2);
     }

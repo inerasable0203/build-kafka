@@ -62,17 +62,35 @@ final class PartitionLog implements AutoCloseable {
     }
 
     synchronized long append(byte[] key, byte[] value) throws IOException {
+        return appendRecord(new Record(nextOffset, System.currentTimeMillis(), key, value));
+    }
+
+    synchronized void appendReplica(Record record) throws IOException {
+        if (record.offset() != nextOffset) {
+            throw new IOException("replica offset mismatch: expected " + nextOffset
+                    + ", got " + record.offset());
+        }
+        appendRecord(record);
+    }
+
+    synchronized long endOffset() {
+        return nextOffset;
+    }
+
+    private long appendRecord(Record record) throws IOException {
+        byte[] key = record.key();
+        byte[] value = record.value();
         if (key == null && value == null) {
             throw new IllegalArgumentException("tombstone requires a key");
         }
-        byte[] payload = encode(nextOffset, System.currentTimeMillis(), key, value);
+        byte[] payload = encode(record.offset(), record.timestamp(), key, value);
         Segment active = segments.get(segments.size() - 1);
         if (active.log.length() >= segmentBytes && active.log.length() > 0) {
             active = openSegment(nextOffset);
             segments.add(active);
         }
 
-        long offset = nextOffset;
+        long offset = record.offset();
         CRC32 crc = new CRC32();
         crc.update(payload);
 
