@@ -9,6 +9,11 @@ final class Protocol {
     static final byte CREATE_TOPIC = 3;
     static final byte METADATA = 4;
     static final byte COMPACT = 5;
+    static final byte JOIN_GROUP = 6;
+    static final byte HEARTBEAT = 7;
+    static final byte LEAVE_GROUP = 8;
+    static final byte COMMIT_OFFSET = 9;
+    static final byte FETCH_OFFSET = 10;
     static final byte OK = 0;
     static final byte INVALID_REQUEST = 1;
     static final byte SERVER_ERROR = 2;

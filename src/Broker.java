@@ -27,6 +27,7 @@ final class Broker implements AutoCloseable {
     private final long segmentBytes;
     private final long retentionMs;
     private final long retentionBytes;
+    private final ConsumerGroups consumerGroups;
     private final ServerSocket server;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
@@ -51,6 +52,7 @@ final class Broker implements AutoCloseable {
         this.segmentBytes = segmentBytes;
         this.retentionMs = retentionMs;
         this.retentionBytes = retentionBytes;
+        this.consumerGroups = new ConsumerGroups(dataDirectory);
         server = new ServerSocket(port);
     }
 
@@ -103,6 +105,11 @@ final class Broker implements AutoCloseable {
                     case Protocol.CREATE_TOPIC -> createTopic(correlationId, input);
                     case Protocol.METADATA -> metadata(correlationId, input);
                     case Protocol.COMPACT -> compact(correlationId, input);
+                    case Protocol.JOIN_GROUP -> joinGroup(correlationId, input);
+                    case Protocol.HEARTBEAT -> heartbeat(correlationId, input);
+                    case Protocol.LEAVE_GROUP -> leaveGroup(correlationId, input);
+                    case Protocol.COMMIT_OFFSET -> commitOffset(correlationId, input);
+                    case Protocol.FETCH_OFFSET -> fetchOffset(correlationId, input);
                     default -> error(correlationId, Protocol.INVALID_REQUEST, "unknown api key: " + apiKey);
                 };
             } catch (IllegalArgumentException | EOFException | Protocol.ProtocolException invalid) {
@@ -189,6 +196,80 @@ final class Broker implements AutoCloseable {
         Protocol.requireEnd(input);
         topic(topicName).log(partition).compact();
         return success(correlationId).toByteArray();
+    }
+
+    private byte[] joinGroup(int correlationId, DataInputStream input) throws IOException {
+        String groupId = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        Protocol.requireEnd(input);
+        ConsumerGroups.Assignment assignment = consumerGroups.join(groupId, topicName,
+                topic(topicName).partitionCount());
+        return assignmentResponse(correlationId, assignment);
+    }
+
+    private byte[] heartbeat(int correlationId, DataInputStream input) throws IOException {
+        String groupId = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        String memberId = Protocol.readString(input);
+        Protocol.requireEnd(input);
+        topic(topicName);
+        return assignmentResponse(correlationId,
+                consumerGroups.heartbeat(groupId, topicName, memberId));
+    }
+
+    private byte[] leaveGroup(int correlationId, DataInputStream input) throws IOException {
+        String groupId = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        String memberId = Protocol.readString(input);
+        Protocol.requireEnd(input);
+        topic(topicName);
+        consumerGroups.leave(groupId, topicName, memberId);
+        return success(correlationId).toByteArray();
+    }
+
+    private byte[] commitOffset(int correlationId, DataInputStream input) throws IOException {
+        String groupId = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        String memberId = Protocol.readString(input);
+        int generation = input.readInt();
+        int partition = input.readInt();
+        long nextOffset = input.readLong();
+        Protocol.requireEnd(input);
+        validatePartition(topicName, partition);
+        consumerGroups.commit(groupId, topicName, memberId, generation, partition, nextOffset);
+        return success(correlationId).toByteArray();
+    }
+
+    private byte[] fetchOffset(int correlationId, DataInputStream input) throws IOException {
+        String groupId = Protocol.readString(input);
+        String topicName = Protocol.readString(input);
+        int partition = input.readInt();
+        Protocol.requireEnd(input);
+        validatePartition(topicName, partition);
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            output.writeLong(consumerGroups.fetchOffset(groupId, topicName, partition));
+        }
+        return bytes.toByteArray();
+    }
+
+    private static byte[] assignmentResponse(int correlationId,
+            ConsumerGroups.Assignment assignment) throws IOException {
+        ByteArrayOutputStream bytes = success(correlationId);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, assignment.memberId());
+            output.writeInt(assignment.generation());
+            output.writeInt(assignment.partitions().size());
+            for (int partition : assignment.partitions()) output.writeInt(partition);
+        }
+        return bytes.toByteArray();
+    }
+
+    private void validatePartition(String topicName, int partition) throws IOException {
+        int count = topic(topicName).partitionCount();
+        if (partition < 0 || partition >= count) {
+            throw new IllegalArgumentException("partition must be between 0 and " + (count - 1));
+        }
     }
 
     private static ByteArrayOutputStream success(int correlationId) throws IOException {

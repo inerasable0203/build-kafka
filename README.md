@@ -6,7 +6,7 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 
 ## 현재 상태
 
-**Milestone 5 완료:** retention, log compaction, tombstone
+**Milestone 6 완료:** consumer offset과 consumer group
 
 - 레코드를 append-only 방식으로 저장
 - 0부터 증가하는 offset 발급
@@ -24,8 +24,9 @@ Kafka를 가져다 쓰는 대신, 작은 메시지 로그부터 시작해 분산
 - 재시작 시 segment 검증과 index 재구성
 - 시간·용량 기준으로 오래된 closed segment 삭제
 - key별 오래된 값을 정리하는 compaction과 tombstone
+- group별 다음 읽을 offset 저장, heartbeat, 파티션 배정과 재배정
 
-아직 consumer group과 replication은 없습니다.
+아직 replication은 없습니다.
 
 ## 빠른 실행
 
@@ -78,6 +79,13 @@ java -cp out MiniKafka delete 127.0.0.1 9092 orders customer-1 1
 java -cp out MiniKafka compact 127.0.0.1 9092 orders 1
 ```
 
+group으로 읽으려면 아래 명령을 실행합니다. 마지막 `1`은 한 번만 조회하고 종료한다는 뜻이며, 생략하면 계속 조회합니다.
+
+```bash
+java -cp out MiniKafka consume-group 127.0.0.1 9092 workers orders 1
+java -cp out MiniKafka group-offset 127.0.0.1 9092 workers orders 1
+```
+
 partition을 생략하면 key가 있는 레코드는 key hash로 partition을 정합니다. null key(`-`)는 같은 producer 프로세스 안에서 round-robin으로 선택합니다. 이 CLI는 명령마다 새 프로세스이므로 여러 null-key 명령의 분산을 관찰하려면 이후 장기 실행 producer 또는 self-test를 사용해야 합니다.
 
 ## 현재 구조
@@ -91,9 +99,11 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 │       ├── 02-tcp-broker.md
 │       ├── 03-topics-partitions.md
 │       ├── 04-segments-index.md
-│       └── 05-retention-compaction.md
+│       ├── 05-retention-compaction.md
+│       └── 06-consumer-groups.md
 └── src
     ├── Broker.java          # TCP 연결과 request 처리
+    ├── ConsumerGroups.java  # membership, assignment, offset 저장
     ├── MiniKafka.java       # CLI와 network client
     ├── PartitionLog.java    # append-only disk log
     └── Protocol.java        # binary frame과 자료형 encoding
@@ -101,6 +111,7 @@ partition을 생략하면 key가 있는 레코드는 key hash로 partition을 �
 data/                       # 실행 시 생성되며 Git에는 포함하지 않음
 └── <topic>/
     ├── topic.meta          # partition 개수
+    ├── .consumer-offsets/  # group별 다음 읽을 offset
     └── <partition>/
         ├── 0.log           # base offset이 0인 segment
         ├── 0.index         # (offset, 파일 내 위치) 쌍
@@ -149,6 +160,12 @@ java -cp out MiniKafka broker data 9092 256 60000 4096
 
 `compact`는 지정한 partition의 닫힌 segment에서 key별 오래된 값을 제거합니다. key가 없는 레코드와 각 key의 마지막 레코드(tombstone 포함)는 남습니다. offset은 다시 매기지 않으므로 삭제된 offset부터 fetch하면 다음 남은 레코드가 반환됩니다. 자세한 실습은 [Milestone 5 문서](docs/milestones/05-retention-compaction.md)를 참고하세요.
 
+## Consumer group
+
+같은 group의 consumer는 파티션을 나눠 읽고, 다른 group은 같은 데이터를 독립적으로 읽습니다. 처리 후 저장하는 committed offset은 **마지막으로 읽은 번호가 아니라 다음에 읽을 번호**입니다. group member와 배정은 broker 메모리에만 두고, committed offset은 `data/<topic>/.consumer-offsets/<group>/<partition>.offset`에 저장합니다. 재시작하면 consumer는 다시 join해야 하지만 읽던 위치는 유지됩니다.
+
+`consume-group`은 heartbeat를 보내며 배정된 파티션만 읽고 출력 후 offset을 저장합니다. member가 떠나거나 10초 동안 heartbeat가 없으면 남은 member에게 파티션을 재배정합니다. 출력과 commit 사이에 종료되면 같은 레코드가 다시 보일 수 있습니다. 자세한 실습은 [Milestone 6 문서](docs/milestones/06-consumer-groups.md)를 참고하세요.
+
 ## TCP frame 형식
 
 모든 request와 response 앞에는 뒤따르는 body 크기를 나타내는 4-byte 정수가 붙습니다.
@@ -158,7 +175,7 @@ request  = frame size | correlation ID | API key | API payload
 response = frame size | correlation ID | status  | response payload
 ```
 
-현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`, `COMPACT`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
+현재 API는 `PRODUCE`, `FETCH`, `CREATE_TOPIC`, `METADATA`, `COMPACT`, `JOIN_GROUP`, `HEARTBEAT`, `LEAVE_GROUP`, `COMMIT_OFFSET`, `FETCH_OFFSET`입니다. 이것은 학습용 protocol이며 실제 Apache Kafka wire protocol과 호환되지 않습니다. 자세한 필드 구성은 각 마일스톤 문서에 기록합니다.
 
 ## 마일스톤 문서
 
@@ -167,6 +184,7 @@ response = frame size | correlation ID | status  | response payload
 - [Milestone 3 — topic과 partition](docs/milestones/03-topics-partitions.md)
 - [Milestone 4 — log segment와 sparse index](docs/milestones/04-segments-index.md)
 - [Milestone 5 — retention과 log compaction](docs/milestones/05-retention-compaction.md)
+- [Milestone 6 — consumer offset과 group](docs/milestones/06-consumer-groups.md)
 
 ## 구현 순서
 
@@ -244,15 +262,17 @@ response = frame size | correlation ID | status  | response payload
 
 **완료 조건:** active segment를 손상시키지 않고 정책에 해당하는 closed segment만 정리해야 합니다.
 
-### Milestone 6 — consumer offset과 consumer group
+완성된 코드는 Git tag `milestone-5`에서 확인할 수 있습니다.
+
+### Milestone 6 — consumer offset과 consumer group `[완료]`
 
 **배우는 것:** queue의 경쟁 소비와 pub/sub을 consumer group 하나로 표현하는 방식
 
-- [ ] group별 committed offset 저장
-- [ ] offset commit/fetch API
-- [ ] group membership과 heartbeat
-- [ ] partition assignment
-- [ ] consumer join/leave 시 rebalance
+- [x] group별 committed offset 저장
+- [x] offset commit/fetch API
+- [x] group membership과 heartbeat
+- [x] partition assignment
+- [x] consumer join/leave 시 rebalance
 
 **완료 조건:** 같은 group의 consumer들은 partition을 나눠 처리하고, 다른 group은 동일한 레코드를 독립적으로 읽어야 합니다. 재시작한 consumer는 committed offset부터 이어서 읽어야 합니다.
 

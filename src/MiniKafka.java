@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class MiniKafka {
     record ProduceResult(int partition, long offset) {}
@@ -41,6 +42,8 @@ public final class MiniKafka {
             case "produce" -> produceCommand(args);
             case "delete" -> deleteCommand(args);
             case "consume" -> consumeCommand(args);
+            case "consume-group" -> consumeGroupCommand(args);
+            case "group-offset" -> groupOffsetCommand(args);
             case "compact" -> compactCommand(args);
             default -> usage();
         }
@@ -107,6 +110,81 @@ public final class MiniKafka {
             String value = record.value() == null ? "<tombstone>"
                     : new String(record.value(), StandardCharsets.UTF_8);
             System.out.printf("%d\t%s\t%s%n", record.offset(), key, value);
+        }
+    }
+
+    private static void groupOffsetCommand(String[] args) throws IOException {
+        if (args.length != 6) usage();
+        long offset = fetchCommittedOffset(args[1], parsePort(args[2]), args[3], args[4],
+                parsePartition(args[5]));
+        System.out.println(offset < 0 ? "no committed offset" : "next offset=" + offset);
+    }
+
+    private static void consumeGroupCommand(String[] args) throws Exception {
+        if (args.length < 5 || args.length > 6) usage();
+        String host = args[1];
+        int port = parsePort(args[2]);
+        String group = args[3];
+        String topic = args[4];
+        int polls = args.length == 6 ? Integer.parseInt(args[5]) : Integer.MAX_VALUE;
+        if (polls < 1) throw new IllegalArgumentException("polls must be positive");
+
+        ConsumerGroups.Assignment session = joinGroup(host, port, group, topic);
+        String memberId = session.memberId();
+        Thread shutdown = new Thread(() -> {
+            try {
+                leaveGroup(host, port, group, topic, memberId);
+            } catch (IOException ignored) {
+            }
+        }, "leave-consumer-group");
+        Runtime.getRuntime().addShutdownHook(shutdown);
+        try {
+            for (int poll = 0; poll < polls; poll++) {
+                ConsumerGroups.Assignment updated = heartbeat(host, port, group, topic, memberId);
+                if (session.generation() != updated.generation()
+                        || !session.partitions().equals(updated.partitions())) {
+                    System.out.printf("generation=%d partitions=%s%n",
+                            updated.generation(), updated.partitions());
+                } else if (poll == 0) {
+                    System.out.printf("member=%s partitions=%s%n", memberId, updated.partitions());
+                }
+                session = updated;
+                for (int partition : session.partitions()) {
+                    long offset = fetchCommittedOffset(host, port, group, topic, partition);
+                    List<PartitionLog.Record> records = fetch(host, port, topic, partition,
+                            Math.max(0, offset));
+                    for (PartitionLog.Record record : records) {
+                        String key = record.key() == null ? "-"
+                                : new String(record.key(), StandardCharsets.UTF_8);
+                        String value = record.value() == null ? "<tombstone>"
+                                : new String(record.value(), StandardCharsets.UTF_8);
+                        System.out.printf("partition=%d offset=%d key=%s value=%s%n",
+                                partition, record.offset(), key, value);
+                    }
+                    if (!records.isEmpty()) {
+                        long nextOffset = records.get(records.size() - 1).offset() + 1;
+                        try {
+                            commitOffset(host, port, group, topic, memberId,
+                                    session.generation(), partition, nextOffset);
+                        } catch (IOException failure) {
+                            if (!"stale generation or unassigned partition".equals(failure.getMessage())) {
+                                throw failure;
+                            }
+                            break; // Rebalance raced with processing; retry from the last committed offset.
+                        }
+                    }
+                }
+                if (poll + 1 < polls) Thread.sleep(1_000);
+            }
+        } finally {
+            try {
+                Runtime.getRuntime().removeShutdownHook(shutdown);
+                leaveGroup(host, port, group, topic, memberId);
+            } catch (IllegalStateException shuttingDown) {
+                // The shutdown hook will leave the group.
+            } catch (IOException unavailable) {
+                System.err.println("could not leave group: " + unavailable.getMessage());
+            }
         }
     }
 
@@ -202,6 +280,101 @@ public final class MiniKafka {
         try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
             Protocol.requireEnd(response);
         }
+    }
+
+    static ConsumerGroups.Assignment joinGroup(String host, int port, String group, String topic)
+            throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.JOIN_GROUP);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, group);
+            Protocol.writeString(output, topic);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            return readAssignment(response);
+        }
+    }
+
+    static ConsumerGroups.Assignment heartbeat(String host, int port, String group,
+            String topic, String memberId) throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.HEARTBEAT);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, group);
+            Protocol.writeString(output, topic);
+            Protocol.writeString(output, memberId);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            return readAssignment(response);
+        }
+    }
+
+    static void leaveGroup(String host, int port, String group, String topic, String memberId)
+            throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.LEAVE_GROUP);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, group);
+            Protocol.writeString(output, topic);
+            Protocol.writeString(output, memberId);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            Protocol.requireEnd(response);
+        }
+    }
+
+    static void commitOffset(String host, int port, String group, String topic,
+            String memberId, int generation, int partition, long nextOffset) throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.COMMIT_OFFSET);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, group);
+            Protocol.writeString(output, topic);
+            Protocol.writeString(output, memberId);
+            output.writeInt(generation);
+            output.writeInt(partition);
+            output.writeLong(nextOffset);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            Protocol.requireEnd(response);
+        }
+    }
+
+    static long fetchCommittedOffset(String host, int port, String group, String topic,
+            int partition) throws IOException {
+        int correlationId = CORRELATION_IDS.incrementAndGet();
+        ByteArrayOutputStream bytes = request(correlationId, Protocol.FETCH_OFFSET);
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            Protocol.writeString(output, group);
+            Protocol.writeString(output, topic);
+            output.writeInt(partition);
+        }
+        try (DataInputStream response = exchange(host, port, bytes.toByteArray(), correlationId)) {
+            long offset = response.readLong();
+            if (offset < -1) throw new Protocol.ProtocolException("invalid committed offset");
+            Protocol.requireEnd(response);
+            return offset;
+        }
+    }
+
+    private static ConsumerGroups.Assignment readAssignment(DataInputStream response)
+            throws IOException {
+        String memberId = Protocol.readString(response);
+        int generation = response.readInt();
+        int count = response.readInt();
+        if (generation < 1 || count < 0 || count > 1_000 || count > response.available() / Integer.BYTES) {
+            throw new Protocol.ProtocolException("invalid group assignment");
+        }
+        List<Integer> partitions = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            int partition = response.readInt();
+            if (partition < 0 || partitions.contains(partition)) {
+                throw new Protocol.ProtocolException("invalid assigned partition");
+            }
+            partitions.add(partition);
+        }
+        Protocol.requireEnd(response);
+        return new ConsumerGroups.Assignment(memberId, generation, List.copyOf(partitions));
     }
 
     private static int choosePartition(String host, int port, String topic, byte[] key)
@@ -309,6 +482,8 @@ public final class MiniKafka {
             assert fetch(host, port, "orders", 1, tombstone.offset()).get(0).value() == null;
             compact(host, port, "orders", 1);
 
+            consumerGroupSelfTest(host, port);
+
             rejectOversizedFrame(port);
             broker.close();
             brokerThread.join(2_000);
@@ -333,12 +508,22 @@ public final class MiniKafka {
                 }, "mini-kafka-restart-test");
                 restartedThread.start();
                 assert partitionCount(host, restarted.port(), "orders") == 3;
+                assert fetchCommittedOffset(host, restarted.port(), "workers", "orders", 0) == 1;
+                ConsumerGroups.Assignment rejoined = joinGroup(host, restarted.port(),
+                        "workers", "orders");
+                assert rejoined.partitions().equals(List.of(0, 1, 2));
+                assert fetch(host, restarted.port(), "orders", 0, 1).get(0).offset() == 1;
+                commitOffset(host, restarted.port(), "workers", "orders", rejoined.memberId(),
+                        rejoined.generation(), 0, 2);
+                assert fetchCommittedOffset(host, restarted.port(), "workers", "orders", 0) == 2;
+                leaveGroup(host, restarted.port(), "workers", "orders", rejoined.memberId());
             }
             restartedThread.join(2_000);
             assert !restartedThread.isAlive();
             if (restartFailure.get() != null) throw new AssertionError(restartFailure.get());
             segmentSelfTest(directory);
             retentionCompactionSelfTest(directory);
+            groupTimeoutSelfTest(directory);
             System.out.println("self-test passed");
         } finally {
             broker.close();
@@ -353,6 +538,63 @@ public final class MiniKafka {
                 });
             }
         }
+    }
+
+    private static void consumerGroupSelfTest(String host, int port) throws IOException {
+        assert produce(host, port, "orders", utf8("resume"), utf8("second"), 0).offset() >= 1;
+        ConsumerGroups.Assignment first = joinGroup(host, port, "workers", "orders");
+        assert first.partitions().equals(List.of(0, 1, 2));
+        assert fetchCommittedOffset(host, port, "workers", "orders", 0) == -1;
+
+        ConsumerGroups.Assignment second = joinGroup(host, port, "workers", "orders");
+        assert second.generation() > first.generation();
+        assert second.partitions().equals(List.of(1));
+        try {
+            commitOffset(host, port, "workers", "orders", first.memberId(),
+                    first.generation(), 0, 1);
+            throw new AssertionError("stale generation was accepted");
+        } catch (IOException expected) {
+            assert expected.getMessage().contains("stale generation");
+        }
+
+        first = heartbeat(host, port, "workers", "orders", first.memberId());
+        assert first.partitions().equals(List.of(0, 2));
+        try {
+            commitOffset(host, port, "workers", "orders", first.memberId(),
+                    first.generation(), 1, 1);
+            throw new AssertionError("unassigned partition was accepted");
+        } catch (IOException expected) {
+            assert expected.getMessage().contains("unassigned partition");
+        }
+        commitOffset(host, port, "workers", "orders", first.memberId(),
+                first.generation(), 0, 1);
+        assert fetchCommittedOffset(host, port, "workers", "orders", 0) == 1;
+
+        ConsumerGroups.Assignment auditors = joinGroup(host, port, "auditors", "orders");
+        assert auditors.partitions().equals(List.of(0, 1, 2));
+        assert fetchCommittedOffset(host, port, "auditors", "orders", 0) == -1;
+        assert fetch(host, port, "orders", 0, 0).get(0).offset() == 0;
+        leaveGroup(host, port, "auditors", "orders", auditors.memberId());
+
+        leaveGroup(host, port, "workers", "orders", second.memberId());
+        first = heartbeat(host, port, "workers", "orders", first.memberId());
+        assert first.partitions().equals(List.of(0, 1, 2));
+        leaveGroup(host, port, "workers", "orders", first.memberId());
+    }
+
+    private static void groupTimeoutSelfTest(Path directory) {
+        AtomicLong now = new AtomicLong(1_000);
+        ConsumerGroups groups = new ConsumerGroups(directory, now::get);
+        ConsumerGroups.Assignment first = groups.join("timeout", "orders", 3);
+        now.addAndGet(ConsumerGroups.SESSION_TIMEOUT_MS);
+        try {
+            groups.heartbeat("timeout", "orders", first.memberId());
+            throw new AssertionError("expired member was accepted");
+        } catch (IllegalArgumentException expected) {
+            assert expected.getMessage().contains("join again");
+        }
+        ConsumerGroups.Assignment replacement = groups.join("timeout", "orders", 3);
+        assert replacement.partitions().equals(List.of(0, 1, 2));
     }
 
     private static void segmentSelfTest(Path directory) throws IOException {
@@ -489,6 +731,8 @@ public final class MiniKafka {
         System.err.println("  MiniKafka produce <host> <port> <topic> <key|-> <value> [partition]");
         System.err.println("  MiniKafka delete <host> <port> <topic> <key> [partition]");
         System.err.println("  MiniKafka consume <host> <port> <topic> <partition> <offset>");
+        System.err.println("  MiniKafka consume-group <host> <port> <group> <topic> [polls]");
+        System.err.println("  MiniKafka group-offset <host> <port> <group> <topic> <partition>");
         System.err.println("  MiniKafka compact <host> <port> <topic> <partition>");
         System.err.println("  MiniKafka self-test");
         System.exit(2);
